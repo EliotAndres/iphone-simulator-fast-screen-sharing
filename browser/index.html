@@ -9,10 +9,11 @@
     body {
       background: #0d0d0d;
       display: flex;
-      flex-direction: column;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       color: #fff;
     }
@@ -36,25 +37,14 @@
     #status-dot.connecting { background: #f0a500; }
     #status-dot.streaming  { background: #30d158; }
     #status-dot.error      { background: #ff453a; }
-    #video-container { max-width: 90vw; max-height: 60vh; }
     video {
-      max-width: 90vw; max-height: 60vh;
+      max-width: 100vw;
+      max-height: 100vh;
+      object-fit: contain;
       border-radius: 12px;
       box-shadow: 0 24px 80px rgba(0,0,0,0.6);
       display: block;
     }
-    #log {
-      position: fixed; bottom: 0; left: 0; right: 0;
-      height: 35vh; overflow-y: auto;
-      background: rgba(0,0,0,0.9);
-      font-family: monospace; font-size: 10px;
-      padding: 6px 8px;
-      border-top: 1px solid rgba(255,255,255,0.1);
-    }
-    #log div { padding: 1px 0; color: #aaa; word-break: break-all; }
-    #log div.err  { color: #ff6b6b; }
-    #log div.ok   { color: #30d158; }
-    #log div.warn { color: #f0a500; }
   </style>
 </head>
 <body>
@@ -62,57 +52,40 @@
     <div id="status-dot" class="connecting"></div>
     <span id="status-text">Connecting...</span>
   </div>
-  <div id="video-container">
-    <video id="video" autoplay playsinline muted></video>
-  </div>
-  <div id="log"></div>
+  <video id="video" autoplay playsinline muted></video>
 
   <script>
     const video = document.getElementById('video');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
-    const logEl = document.getElementById('log');
-
-    function log(msg, type) {
-      const d = document.createElement('div');
-      d.textContent = new Date().toISOString().slice(11,23) + ' ' + msg;
-      if (type) d.className = type;
-      logEl.appendChild(d);
-      logEl.scrollTop = logEl.scrollHeight;
-    }
 
     function setStatus(state, text) {
       statusDot.className = state;
       statusText.textContent = text;
-      log('[status] ' + text, state === 'error' ? 'err' : state === 'streaming' ? 'ok' : 'warn');
     }
-
-    log('UA: ' + navigator.userAgent.slice(0, 80));
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
 
-    video.onplaying = () => { log('video playing', 'ok'); setStatus('streaming', 'Streaming'); };
-    video.onwaiting = () => log('video waiting', 'warn');
-    video.onerror   = () => log('video error: ' + (video.error && video.error.message), 'err');
+    video.onplaying = () => setStatus('streaming', 'Streaming');
+    video.onerror   = () => setStatus('error', 'Video error');
 
     pc.ontrack = (event) => {
-      log('ontrack kind=' + event.track.kind + ' readyState=' + event.track.readyState, 'ok');
-      log('streams: ' + event.streams.length);
-      if (event.streams && event.streams[0]) {
-        video.srcObject = event.streams[0];
-        video.play().catch(e => {
-          log('play() failed: ' + e, 'warn');
-          setStatus('connecting', 'Tap to play');
-          document.body.addEventListener('click', () => video.play(), { once: true });
-        });
-      }
+      // Safari bug: event.streams may be empty even when a track arrives.
+      // Work around by building a MediaStream manually from the track.
+      let stream = (event.streams && event.streams[0]) || null;
+      if (!stream) stream = new MediaStream([event.track]);
+
+      video.srcObject = stream;
+      video.play().catch(() => {
+        setStatus('connecting', 'Tap to play');
+        document.body.addEventListener('click', () => video.play(), { once: true });
+      });
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate && event.candidate.candidate) {
-        log('ICE local: ' + event.candidate.candidate.slice(0, 60));
         ws.send(JSON.stringify({
           type: 'ice-candidate',
           candidate: event.candidate.candidate,
@@ -122,82 +95,54 @@
       }
     };
 
-    pc.oniceconnectionstatechange = () => {
-      log('ICE: ' + pc.iceConnectionState,
-        pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok' :
-        pc.iceConnectionState === 'failed' ? 'err' : '');
-    };
-
     pc.onconnectionstatechange = () => {
-      log('Connection: ' + pc.connectionState,
-        pc.connectionState === 'connected' ? 'ok' :
-        pc.connectionState === 'failed' ? 'err' : '');
+      if (pc.connectionState === 'failed') setStatus('error', 'Connection failed');
     };
 
-    pc.onsignalingstatechange = () => log('Signaling: ' + pc.signalingState);
-
-    // Poll video state every 2s
-    setInterval(() => {
-      if (video.srcObject) {
-        log('poll: readyState=' + video.readyState + ' ' + video.videoWidth + 'x' + video.videoHeight + ' t=' + video.currentTime.toFixed(2) + ' paused=' + video.paused);
-      }
-    }, 2000);
-
-    const ws = new WebSocket('ws://localhost:8080');
+    const ws = new WebSocket(`ws://${window.location.hostname}:8080`);
 
     ws.onopen = () => {
-      log('WS connected', 'ok');
       ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));
       setStatus('connecting', 'Waiting for streamer...');
     };
 
     ws.onmessage = async (event) => {
       let msg;
-      try { msg = JSON.parse(event.data); } catch (e) { log('Bad JSON: ' + e, 'err'); return; }
-      log('WS rx: ' + msg.type);
+      try { msg = JSON.parse(event.data); } catch { return; }
 
       if (msg.type === 'streamer-ready') {
         setStatus('connecting', 'Negotiating...');
         await createAndSendOffer();
       } else if (msg.type === 'answer') {
-        log('setRemoteDesc answer len=' + msg.sdp.length);
-        const videoLines = msg.sdp.split('\n').filter(l => l.startsWith('m=video') || l.startsWith('a=rtpmap'));
-        log('codecs: ' + videoLines.slice(0,4).join(' | ').slice(0, 180));
         try {
           await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-          log('setRemoteDesc ok', 'ok');
-        } catch (e) {
-          log('setRemoteDesc FAIL: ' + e, 'err');
-        }
+        } catch { setStatus('error', 'Negotiation failed'); }
       } else if (msg.type === 'ice-candidate') {
         if (!msg.candidate) return;
-        log('ICE remote: ' + msg.candidate.slice(0, 60));
         try {
           await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex, sdpMid: msg.sdpMid });
-        } catch (e) {
-          log('addIceCandidate FAIL: ' + e, 'err');
-        }
+        } catch { /* ignore stale candidates */ }
       } else if (msg.type === 'streamer-disconnected') {
         setStatus('error', 'Streamer disconnected');
         video.srcObject = null;
       }
     };
 
-    ws.onerror = () => { log('WS error', 'err'); setStatus('error', 'Signaling unreachable'); };
-    ws.onclose = (e) => { log('WS closed ' + e.code, 'err'); setStatus('error', 'WS closed'); };
+    ws.onerror = () => setStatus('error', 'Signaling unreachable');
+    ws.onclose = () => setStatus('error', 'WS closed');
 
     async function createAndSendOffer() {
       try {
-        log('createOffer...');
-        const offer = await pc.createOffer({ offerToReceiveVideo: true });
+        // addTransceiver is the correct Unified Plan approach for recvonly video.
+        // offerToReceiveVideo is a legacy Plan-B hint that Safari ignores.
+        if (pc.getTransceivers().length === 0) {
+          pc.addTransceiver('video', { direction: 'recvonly' });
+        }
+        const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        const videoLines = offer.sdp.split('\n').filter(l => l.startsWith('m=video') || l.startsWith('a=rtpmap'));
-        log('offer codecs: ' + videoLines.slice(0,4).join(' | ').slice(0, 180));
         ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
-        log('Offer sent len=' + offer.sdp.length, 'ok');
-      } catch (e) {
-        log('createOffer FAIL: ' + e, 'err');
-        setStatus('error', 'Offer error');
+      } catch {
+        setStatus('error', 'Offer failed');
       }
     }
   </script>
