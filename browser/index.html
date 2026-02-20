@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>iOS Simulator Stream</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d0d0d;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      color: #fff;
+    }
+    #status-bar {
+      position: fixed;
+      top: 16px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 20px;
+      padding: 6px 16px;
+      font-size: 13px;
+      display: flex; align-items: center; gap: 8px;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+    }
+    #status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #888; flex-shrink: 0; transition: background 0.3s;
+    }
+    #status-dot.connecting { background: #f0a500; }
+    #status-dot.streaming  { background: #30d158; }
+    #status-dot.error      { background: #ff453a; }
+    #video-container { max-width: 90vw; max-height: 60vh; }
+    video {
+      max-width: 90vw; max-height: 60vh;
+      border-radius: 12px;
+      box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+      display: block;
+    }
+    #log {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      height: 35vh; overflow-y: auto;
+      background: rgba(0,0,0,0.9);
+      font-family: monospace; font-size: 10px;
+      padding: 6px 8px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+    }
+    #log div { padding: 1px 0; color: #aaa; word-break: break-all; }
+    #log div.err  { color: #ff6b6b; }
+    #log div.ok   { color: #30d158; }
+    #log div.warn { color: #f0a500; }
+  </style>
+</head>
+<body>
+  <div id="status-bar">
+    <div id="status-dot" class="connecting"></div>
+    <span id="status-text">Connecting...</span>
+  </div>
+  <div id="video-container">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    const video = document.getElementById('video');
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+    const logEl = document.getElementById('log');
+
+    function log(msg, type) {
+      const d = document.createElement('div');
+      d.textContent = new Date().toISOString().slice(11,23) + ' ' + msg;
+      if (type) d.className = type;
+      logEl.appendChild(d);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(state, text) {
+      statusDot.className = state;
+      statusText.textContent = text;
+      log('[status] ' + text, state === 'error' ? 'err' : state === 'streaming' ? 'ok' : 'warn');
+    }
+
+    log('UA: ' + navigator.userAgent.slice(0, 80));
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    video.onplaying = () => { log('video playing', 'ok'); setStatus('streaming', 'Streaming'); };
+    video.onwaiting = () => log('video waiting', 'warn');
+    video.onerror   = () => log('video error: ' + (video.error && video.error.message), 'err');
+
+    pc.ontrack = (event) => {
+      log('ontrack kind=' + event.track.kind + ' readyState=' + event.track.readyState, 'ok');
+      log('streams: ' + event.streams.length);
+      if (event.streams && event.streams[0]) {
+        video.srcObject = event.streams[0];
+        video.play().catch(e => {
+          log('play() failed: ' + e, 'warn');
+          setStatus('connecting', 'Tap to play');
+          document.body.addEventListener('click', () => video.play(), { once: true });
+        });
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && event.candidate.candidate) {
+        log('ICE local: ' + event.candidate.candidate.slice(0, 60));
+        ws.send(JSON.stringify({
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          sdpMid: event.candidate.sdpMid
+        }));
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      log('ICE: ' + pc.iceConnectionState,
+        pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok' :
+        pc.iceConnectionState === 'failed' ? 'err' : '');
+    };
+
+    pc.onconnectionstatechange = () => {
+      log('Connection: ' + pc.connectionState,
+        pc.connectionState === 'connected' ? 'ok' :
+        pc.connectionState === 'failed' ? 'err' : '');
+    };
+
+    pc.onsignalingstatechange = () => log('Signaling: ' + pc.signalingState);
+
+    // Poll video state every 2s
+    setInterval(() => {
+      if (video.srcObject) {
+        log('poll: readyState=' + video.readyState + ' ' + video.videoWidth + 'x' + video.videoHeight + ' t=' + video.currentTime.toFixed(2) + ' paused=' + video.paused);
+      }
+    }, 2000);
+
+    const ws = new WebSocket('ws://localhost:8080');
+
+    ws.onopen = () => {
+      log('WS connected', 'ok');
+      ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));
+      setStatus('connecting', 'Waiting for streamer...');
+    };
+
+    ws.onmessage = async (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (e) { log('Bad JSON: ' + e, 'err'); return; }
+      log('WS rx: ' + msg.type);
+
+      if (msg.type === 'streamer-ready') {
+        setStatus('connecting', 'Negotiating...');
+        await createAndSendOffer();
+      } else if (msg.type === 'answer') {
+        log('setRemoteDesc answer len=' + msg.sdp.length);
+        const videoLines = msg.sdp.split('\n').filter(l => l.startsWith('m=video') || l.startsWith('a=rtpmap'));
+        log('codecs: ' + videoLines.slice(0,4).join(' | ').slice(0, 180));
+        try {
+          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          log('setRemoteDesc ok', 'ok');
+        } catch (e) {
+          log('setRemoteDesc FAIL: ' + e, 'err');
+        }
+      } else if (msg.type === 'ice-candidate') {
+        if (!msg.candidate) return;
+        log('ICE remote: ' + msg.candidate.slice(0, 60));
+        try {
+          await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex, sdpMid: msg.sdpMid });
+        } catch (e) {
+          log('addIceCandidate FAIL: ' + e, 'err');
+        }
+      } else if (msg.type === 'streamer-disconnected') {
+        setStatus('error', 'Streamer disconnected');
+        video.srcObject = null;
+      }
+    };
+
+    ws.onerror = () => { log('WS error', 'err'); setStatus('error', 'Signaling unreachable'); };
+    ws.onclose = (e) => { log('WS closed ' + e.code, 'err'); setStatus('error', 'WS closed'); };
+
+    async function createAndSendOffer() {
+      try {
+        log('createOffer...');
+        const offer = await pc.createOffer({ offerToReceiveVideo: true });
+        await pc.setLocalDescription(offer);
+        const videoLines = offer.sdp.split('\n').filter(l => l.startsWith('m=video') || l.startsWith('a=rtpmap'));
+        log('offer codecs: ' + videoLines.slice(0,4).join(' | ').slice(0, 180));
+        ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+        log('Offer sent len=' + offer.sdp.length, 'ok');
+      } catch (e) {
+        log('createOffer FAIL: ' + e, 'err');
+        setStatus('error', 'Offer error');
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,145 @@
+import Foundation
+import WebRTC
+
+final class WebRTCManager: NSObject {
+    var onIceCandidate: ((RTCIceCandidate) -> Void)?
+    var onConnectionStateChange: ((RTCPeerConnectionState) -> Void)?
+
+    private let factory: RTCPeerConnectionFactory
+    private var peerConnection: RTCPeerConnection?
+    private let videoSource: RTCVideoSource
+    private let capturer: RTCVideoCapturer
+
+    private var frameCount = 0
+
+    override init() {
+        RTCInitializeSSL()
+        let encoderFactory = RTCDefaultVideoEncoderFactory()
+        let decoderFactory = RTCDefaultVideoDecoderFactory()
+        factory = RTCPeerConnectionFactory(encoderFactory: encoderFactory, decoderFactory: decoderFactory)
+        videoSource = factory.videoSource()
+        capturer = RTCVideoCapturer(delegate: videoSource)
+        super.init()
+    }
+
+    func pushFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+        frameCount += 1
+        if frameCount % 90 == 0 {
+            print("[WebRTC] Pushed \(frameCount) frames, pc=\(peerConnection?.connectionState.rawValue ?? -1)")
+        }
+
+        let rtcPixelBuffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
+        let timeStampNs = Int64(CMTimeGetSeconds(timestamp) * Double(NSEC_PER_SEC))
+        let frame = RTCVideoFrame(buffer: rtcPixelBuffer, rotation: ._0, timeStampNs: timeStampNs)
+        videoSource.capturer(capturer, didCapture: frame)
+    }
+
+    func handleOffer(_ sdpString: String) async throws -> String {
+        // Close previous peer connection before creating a new one
+        if let old = peerConnection {
+            print("[WebRTC] Closing previous peer connection")
+            old.close()
+            peerConnection = nil
+        }
+
+        let config = makeConfiguration()
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+
+        guard let pc = factory.peerConnection(with: config, constraints: constraints, delegate: self) else {
+            throw WebRTCError.peerConnectionFailed
+        }
+        self.peerConnection = pc
+
+        let videoTrack = makeVideoTrack()
+        pc.add(videoTrack, streamIds: ["stream0"])
+
+        let offerSdp = RTCSessionDescription(type: .offer, sdp: sdpString)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            pc.setRemoteDescription(offerSdp) { error in
+                if let error = error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            }
+        }
+
+        let answerSdp: RTCSessionDescription = try await withCheckedThrowingContinuation { continuation in
+            let answerConstraints = RTCMediaConstraints(
+                mandatoryConstraints: ["OfferToReceiveVideo": "false"],
+                optionalConstraints: nil
+            )
+            pc.answer(for: answerConstraints) { sdp, error in
+                if let error = error { continuation.resume(throwing: error) }
+                else if let sdp = sdp { continuation.resume(returning: sdp) }
+                else { continuation.resume(throwing: WebRTCError.noAnswer) }
+            }
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            pc.setLocalDescription(answerSdp) { error in
+                if let error = error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            }
+        }
+
+        // Send answer immediately; ICE candidates are trickled via onIceCandidate
+        print("[WebRTC] Answer ready, sending immediately (trickle ICE)")
+        return answerSdp.sdp
+    }
+
+    func addIceCandidate(_ candidate: RTCIceCandidate) {
+        peerConnection?.add(candidate) { error in
+            if let error = error {
+                print("[WebRTC] Failed to add ICE candidate: \(error)")
+            }
+        }
+    }
+
+    private func makeConfiguration() -> RTCConfiguration {
+        let config = RTCConfiguration()
+        config.iceServers = [
+            RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])
+        ]
+        config.sdpSemantics = .unifiedPlan
+        config.continualGatheringPolicy = .gatherContinually
+        return config
+    }
+
+    private func makeVideoTrack() -> RTCVideoTrack {
+        let track = factory.videoTrack(with: videoSource, trackId: "video0")
+        return track
+    }
+}
+
+enum WebRTCError: Error {
+    case peerConnectionFailed
+    case noAnswer
+}
+
+extension WebRTCManager: RTCPeerConnectionDelegate {
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
+        print("[WebRTC] Signaling state: \(stateChanged.rawValue)")
+    }
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
+    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        print("[WebRTC] ICE connection state: \(newState.rawValue)")
+    }
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
+        print("[WebRTC] ICE gathering state: \(newState.rawValue)")
+    }
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+        onIceCandidate?(candidate)
+    }
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
+        print("[WebRTC] Peer connection state: \(newState.rawValue)")
+        onConnectionStateChange?(newState)
+    }
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill:*)",
+      "Bash(.build/arm64-apple-macosx/debug/SimulatorStream)",
+      "Bash(echo:*)",
+      "Bash(swift build:*)",
+      "Bash(open:*)"
+    ]
+  }
+}

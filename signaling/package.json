@@ -1,0 +1,12 @@
+{
+  "name": "simulator-stream-signaling",
+  "version": "1.0.0",
+  "description": "WebRTC signaling server for iOS Simulator streaming",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

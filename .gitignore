@@ -1,0 +1,13 @@
+# Swift / SPM
+.build/
+*.resolved
+
+# Node
+signaling/node_modules/
+
+# macOS
+.DS_Store
+
+# Logs
+/tmp/streamer.log
+/tmp/signaling.log
