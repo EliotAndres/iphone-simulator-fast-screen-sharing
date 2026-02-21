@@ -1,0 +1,30 @@
+# iOS Simulator Stream
+
+Streams the iOS Simulator screen to a browser over WebRTC. Works on Chrome and Safari.
+
+## Requirements
+
+- macOS 14+
+- Xcode / Swift toolchain
+- Node.js
+- Screen Recording permission granted to Terminal (System Settings → Privacy & Security → Screen Recording)
+
+## Start
+
+Three components must run simultaneously. Open three terminal tabs.
+
+**1. Signaling server**
+```sh
+cd signaling
+npm install
+node server.js
+```
+
+**2. Swift streamer**
+```sh
+swift run
+```
+
+**3. Browser**
+
+Open `http://localhost:3000` in any browser on the same machine, or replace `localhost` with the machine's IP address to view from another device on the network.
