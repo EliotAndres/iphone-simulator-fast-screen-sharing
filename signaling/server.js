@@ -13,11 +13,13 @@ const httpServer = http.createServer((req, res) => {
   });
 });
 
+// WebSocket server attached to HTTP server (same port for tunnel compatibility)
+const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
 httpServer.listen(3000, () => {
   console.log('[Server] HTTP server listening on http://localhost:3000');
+  console.log('[Signaling] WebSocket server on ws://localhost:3000/ws');
 });
-
-const wss = new WebSocketServer({ port: 8080 });
 
 let streamer = null;
 let activeViewer = null; // only one viewer at a time
@@ -97,4 +99,3 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error('[Signaling] Error:', err.message));
 });
 
-console.log('[Signaling] WebSocket server listening on ws://localhost:8080');

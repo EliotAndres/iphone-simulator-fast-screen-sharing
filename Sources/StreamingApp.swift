@@ -7,7 +7,7 @@ final class StreamingApp {
     private let signalingClient: SignalingClient
 
     init() {
-        signalingClient = SignalingClient(url: URL(string: "ws://localhost:8080")!)
+        signalingClient = SignalingClient(url: URL(string: "ws://localhost:3000/ws")!)
     }
 
     func start() {

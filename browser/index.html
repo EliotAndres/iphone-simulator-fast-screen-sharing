@@ -99,7 +99,8 @@
       if (pc.connectionState === 'failed') setStatus('error', 'Connection failed');
     };
 
-    const ws = new WebSocket(`ws://${window.location.hostname}:8080`);
+    const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProto}//${location.host}/ws`);
 
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));

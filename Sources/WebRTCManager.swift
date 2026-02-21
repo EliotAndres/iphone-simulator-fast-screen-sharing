@@ -12,6 +12,8 @@ final class WebRTCManager: NSObject {
 
     private var frameCount = 0
 
+    private var adaptedToSize = false
+
     override init() {
         RTCInitializeSSL()
         let encoderFactory = RTCDefaultVideoEncoderFactory()
@@ -24,6 +26,15 @@ final class WebRTCManager: NSObject {
 
     func pushFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
         frameCount += 1
+
+        if !adaptedToSize {
+            let w = CVPixelBufferGetWidth(pixelBuffer)
+            let h = CVPixelBufferGetHeight(pixelBuffer)
+            videoSource.adaptOutputFormat(toWidth: Int32(w), height: Int32(h), fps: 30)
+            print("[WebRTC] Adapted output format to \(w)x\(h)")
+            adaptedToSize = true
+        }
+
         if frameCount % 90 == 0 {
             print("[WebRTC] Pushed \(frameCount) frames, pc=\(peerConnection?.connectionState.rawValue ?? -1)")
         }
@@ -51,7 +62,8 @@ final class WebRTCManager: NSObject {
         self.peerConnection = pc
 
         let videoTrack = makeVideoTrack()
-        pc.add(videoTrack, streamIds: ["stream0"])
+        let sender = pc.add(videoTrack, streamIds: ["stream0"])
+        configureHighBitrate(sender: sender)
 
         let offerSdp = RTCSessionDescription(type: .offer, sdp: sdpString)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -106,6 +118,16 @@ final class WebRTCManager: NSObject {
     private func makeVideoTrack() -> RTCVideoTrack {
         let track = factory.videoTrack(with: videoSource, trackId: "video0")
         return track
+    }
+
+    private func configureHighBitrate(sender: RTCRtpSender?) {
+        guard let sender = sender else { return }
+        let params = sender.parameters
+        for encoding in params.encodings {
+            encoding.maxBitrateBps = NSNumber(value: 8_000_000)
+            encoding.minBitrateBps = NSNumber(value: 2_000_000)
+        }
+        sender.parameters = params
     }
 }
 
