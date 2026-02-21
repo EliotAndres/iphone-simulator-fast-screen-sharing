@@ -2,6 +2,11 @@
 
 Streams the iOS Simulator screen to a browser over WebRTC. Works on Chrome and Safari.
 
+# ⚠️ INFO
+
+- This requires screen capture and accessibility permissions (accessibility could be removed)
+- You'll need to untick Window > Show Device Bezels (or restart simulator, the swift code changes the preferences)
+
 # Architecture
 
 Required components:
