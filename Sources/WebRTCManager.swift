@@ -4,11 +4,13 @@ import WebRTC
 final class WebRTCManager: NSObject {
     var onIceCandidate: ((RTCIceCandidate) -> Void)?
     var onConnectionStateChange: ((RTCPeerConnectionState) -> Void)?
+    var onTouchEvent: ((TouchEvent) -> Void)?
 
     private let factory: RTCPeerConnectionFactory
     private var peerConnection: RTCPeerConnection?
     private let videoSource: RTCVideoSource
     private let capturer: RTCVideoCapturer
+    private var dataChannel: RTCDataChannel?
 
     private var frameCount = 0
 
@@ -158,10 +160,39 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+        print("[WebRTC] Data channel opened: \(dataChannel.label)")
+        self.dataChannel = dataChannel
+        dataChannel.delegate = self
+    }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
         print("[WebRTC] Peer connection state: \(newState.rawValue)")
         onConnectionStateChange?(newState)
+    }
+}
+
+// MARK: - Data channel (touch events from browser)
+
+struct TouchEvent: Codable {
+    let type: String   // "down", "move", "up"
+    let x: Double      // normalized 0..1
+    let y: Double      // normalized 0..1
+}
+
+extension WebRTCManager: RTCDataChannelDelegate {
+    func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        print("[WebRTC] Data channel state: \(dataChannel.readyState.rawValue)")
+    }
+
+    func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        let raw = String(data: buffer.data, encoding: .utf8) ?? "<binary>"
+        print("[WebRTC] Data channel message: \(raw)")
+        guard let event = try? JSONDecoder().decode(TouchEvent.self, from: buffer.data) else {
+            print("[WebRTC] Failed to decode touch event from: \(raw)")
+            return
+        }
+        print("[WebRTC] Touch event: \(event.type) (\(event.x), \(event.y))")
+        onTouchEvent?(event)
     }
 }

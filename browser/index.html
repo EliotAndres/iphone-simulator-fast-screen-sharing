@@ -44,6 +44,9 @@
       border-radius: 12px;
       box-shadow: 0 24px 80px rgba(0,0,0,0.6);
       display: block;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
     }
   </style>
 </head>
@@ -66,6 +69,63 @@
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    // Data channel for sending touch/mouse events to the streamer
+    const touchChannel = pc.createDataChannel('touch', { ordered: true });
+    touchChannel.onopen = () => console.log('[Touch] Data channel open');
+    touchChannel.onclose = () => console.log('[Touch] Data channel closed');
+
+    function sendTouch(type, clientX, clientY) {
+      if (touchChannel.readyState !== 'open') return;
+      const rect = video.getBoundingClientRect();
+      // Map client coordinates to normalized 0..1 within the video's rendered area,
+      // accounting for object-fit:contain letterboxing.
+      const videoW = video.videoWidth;
+      const videoH = video.videoHeight;
+      if (!videoW || !videoH) return;
+
+      const videoAspect = videoW / videoH;
+      const boxAspect = rect.width / rect.height;
+      let renderW, renderH, offsetX, offsetY;
+      if (videoAspect > boxAspect) {
+        renderW = rect.width;
+        renderH = rect.width / videoAspect;
+        offsetX = 0;
+        offsetY = (rect.height - renderH) / 2;
+      } else {
+        renderH = rect.height;
+        renderW = rect.height * videoAspect;
+        offsetX = (rect.width - renderW) / 2;
+        offsetY = 0;
+      }
+
+      const x = (clientX - rect.left - offsetX) / renderW;
+      const y = (clientY - rect.top - offsetY) / renderH;
+      if (x < 0 || x > 1 || y < 0 || y > 1) return;
+      touchChannel.send(JSON.stringify({ type, x, y }));
+    }
+
+    // Mouse events
+    video.addEventListener('mousedown', (e) => { e.preventDefault(); sendTouch('down', e.clientX, e.clientY); });
+    video.addEventListener('mousemove', (e) => { if (e.buttons & 1) sendTouch('move', e.clientX, e.clientY); });
+    video.addEventListener('mouseup',   (e) => { sendTouch('up', e.clientX, e.clientY); });
+
+    // Touch events (mobile / tablet)
+    video.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      sendTouch('down', t.clientX, t.clientY);
+    });
+    video.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      sendTouch('move', t.clientX, t.clientY);
+    });
+    video.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      const t = e.changedTouches[0];
+      sendTouch('up', t.clientX, t.clientY);
     });
 
     video.onplaying = () => setStatus('streaming', 'Streaming');

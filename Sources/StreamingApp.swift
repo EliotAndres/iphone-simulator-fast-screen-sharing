@@ -5,6 +5,7 @@ final class StreamingApp {
     private let captureManager = CaptureManager()
     private let webRTCManager = WebRTCManager()
     private let signalingClient: SignalingClient
+    private let touchInjector = TouchInjector()
 
     init() {
         signalingClient = SignalingClient(url: URL(string: "ws://localhost:3000/ws")!)
@@ -55,8 +56,15 @@ final class StreamingApp {
             )
         }
 
-        webRTCManager.onConnectionStateChange = { state in
+        webRTCManager.onTouchEvent = { [weak self] event in
+            self?.touchInjector.handleTouch(event)
+        }
+
+        webRTCManager.onConnectionStateChange = { [weak self] state in
             print("[App] WebRTC connection state changed: \(state.rawValue)")
+            if state == .connected {
+                self?.touchInjector.resolveSimulator()
+            }
         }
     }
 }
