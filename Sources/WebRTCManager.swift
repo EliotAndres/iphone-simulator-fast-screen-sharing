@@ -152,7 +152,7 @@ final class WebRTCManager: NSObject {
             }
             let now = CACurrentMediaTime()
             let elapsed = now - self.lastStatsTime
-            if elapsed > 0 && self.lastBytesSent > 0 {
+            if elapsed > 0 && self.lastBytesSent > 0 && totalBytes >= self.lastBytesSent {
                 let deltaBytes = totalBytes - self.lastBytesSent
                 let mbps = Double(deltaBytes) / elapsed / 1_000_000
                 print(String(format: "[WebRTC] Bandwidth: %.2f MB/s (%.1f Mbps)", mbps, mbps * 8))
