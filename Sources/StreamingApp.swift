@@ -63,6 +63,7 @@ final class StreamingApp {
         webRTCManager.onConnectionStateChange = { [weak self] state in
             print("[App] WebRTC connection state changed: \(state.rawValue)")
             if state == .connected {
+                self?.captureManager.sendLastFrame()
                 self?.touchInjector.resolveSimulator()
             }
         }

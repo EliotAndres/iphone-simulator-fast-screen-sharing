@@ -8,6 +8,7 @@ final class CaptureManager: NSObject {
 
     private var stream: SCStream?
     private let streamQueue = DispatchQueue(label: "com.simulatorstream.capture")
+    private var lastPixelBuffer: CVPixelBuffer?
 
     func start() async throws {
         let content: SCShareableContent
@@ -32,6 +33,15 @@ final class CaptureManager: NSObject {
     func stop() async throws {
         try await stream?.stopCapture()
         stream = nil
+    }
+
+    /// Push the last captured frame once, so a newly connected client gets an
+    /// image even if the screen is static.
+    func sendLastFrame() {
+        streamQueue.async { [weak self] in
+            guard let self, let buf = self.lastPixelBuffer else { return }
+            self.onFrame?(buf, CMTime(value: Int64(CACurrentMediaTime() * 1000), timescale: 1000))
+        }
     }
 
     private func makeFilter(from content: SCShareableContent) throws -> (SCContentFilter, CGSize?) {
@@ -83,12 +93,13 @@ enum CaptureError: Error {
 
 extension CaptureManager: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen,
-              sampleBuffer.isValid,
-              let pixelBuffer = sampleBuffer.imageBuffer else {
-            return
-        }
+        guard type == .screen, sampleBuffer.isValid else { return }
+
         let timestamp = sampleBuffer.presentationTimeStamp
-        onFrame?(pixelBuffer, timestamp)
+
+        if let pixelBuffer = sampleBuffer.imageBuffer {
+            lastPixelBuffer = pixelBuffer
+            onFrame?(pixelBuffer, timestamp)
+        }
     }
 }
