@@ -2,6 +2,17 @@
 
 Streams the iOS Simulator screen to a browser over WebRTC. Works on Chrome and Safari.
 
+# Architecture
+
+Required components:
+
+- GRPC to send click events (idb takes 200ms to boot)
+- Node as a signaling server (=websocket coordinator) and reverse proxy (so both webpage and video stream go through the same port)
+
+# TODOs
+
+- Don't enforce "hide bezels"
+
 ## Requirements
 
 - macOS 14+
@@ -14,6 +25,7 @@ Streams the iOS Simulator screen to a browser over WebRTC. Works on Chrome and S
 Three components must run simultaneously. Open three terminal tabs.
 
 **1. Signaling server**
+
 ```sh
 cd signaling
 npm install
@@ -21,6 +33,7 @@ node server.js
 ```
 
 **2. Swift streamer**
+
 ```sh
 swift run
 ```

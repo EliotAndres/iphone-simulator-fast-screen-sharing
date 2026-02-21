@@ -13,8 +13,10 @@ final class WebRTCManager: NSObject {
     private var dataChannel: RTCDataChannel?
 
     private var frameCount = 0
-
     private var adaptedToSize = false
+    private var statsTimer: Timer?
+    private var lastBytesSent: UInt64 = 0
+    private var lastStatsTime: CFTimeInterval = 0
 
     override init() {
         RTCInitializeSSL()
@@ -122,6 +124,44 @@ final class WebRTCManager: NSObject {
         return track
     }
 
+    private func startStatsPolling() {
+        statsTimer?.invalidate()
+        lastBytesSent = 0
+        lastStatsTime = CACurrentMediaTime()
+
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollStats()
+        }
+    }
+
+    private func stopStatsPolling() {
+        statsTimer?.invalidate()
+        statsTimer = nil
+    }
+
+    private func pollStats() {
+        guard let pc = peerConnection else { return }
+        pc.statistics { [weak self] report in
+            guard let self else { return }
+            var totalBytes: UInt64 = 0
+            for (_, stats) in report.statistics {
+                if stats.type == "outbound-rtp",
+                   let bytes = stats.values["bytesSent"] as? UInt64 {
+                    totalBytes += bytes
+                }
+            }
+            let now = CACurrentMediaTime()
+            let elapsed = now - self.lastStatsTime
+            if elapsed > 0 && self.lastBytesSent > 0 {
+                let deltaBytes = totalBytes - self.lastBytesSent
+                let mbps = Double(deltaBytes) / elapsed / 1_000_000
+                print(String(format: "[WebRTC] Bandwidth: %.2f MB/s (%.1f Mbps)", mbps, mbps * 8))
+            }
+            self.lastBytesSent = totalBytes
+            self.lastStatsTime = now
+        }
+    }
+
     private func configureHighBitrate(sender: RTCRtpSender?) {
         guard let sender = sender else { return }
         let params = sender.parameters
@@ -168,6 +208,11 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
         print("[WebRTC] Peer connection state: \(newState.rawValue)")
+        if newState == .connected {
+            DispatchQueue.main.async { self.startStatsPolling() }
+        } else if newState == .disconnected || newState == .failed || newState == .closed {
+            DispatchQueue.main.async { self.stopStatsPolling() }
+        }
         onConnectionStateChange?(newState)
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import CoreMedia
 import CoreVideo
+import AppKit
 
 final class CaptureManager: NSObject {
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
@@ -13,6 +14,8 @@ final class CaptureManager: NSObject {
     private var lastPixelBuffer: CVPixelBuffer?
     private var idleTimer: DispatchSourceTimer?
     private var hasReceivedRealFrame = false
+
+    private(set) var deviceScreenRect: CGRect?
 
     func start() async throws {
         let content: SCShareableContent
@@ -92,7 +95,6 @@ final class CaptureManager: NSObject {
     }
 
     private func makeFilter(from content: SCShareableContent) throws -> (SCContentFilter, CGSize?) {
-        // Try to find the Simulator window first
         if let window = content.windows.first(where: {
             $0.owningApplication?.bundleIdentifier == "com.apple.iphonesimulator"
         }) {
@@ -101,7 +103,6 @@ final class CaptureManager: NSObject {
             return (SCContentFilter(desktopIndependentWindow: window), size)
         }
 
-        // Fall back to application-level filter
         if let app = content.applications.first(where: {
             $0.bundleIdentifier == "com.apple.iphonesimulator"
         }), let display = content.displays.first {
@@ -109,7 +110,6 @@ final class CaptureManager: NSObject {
             return (SCContentFilter(display: display, including: [app], exceptingWindows: []), nil)
         }
 
-        // Last resort: capture entire display
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
         }
@@ -125,12 +125,87 @@ final class CaptureManager: NSObject {
 
         if let size = windowSize {
             let scaleFactor = NSScreen.main?.backingScaleFactor ?? 2.0
-            config.width = Int(size.width * scaleFactor)
-            config.height = Int(size.height * scaleFactor)
-            print("[Capture] Output size: \(config.width)x\(config.height) (scale \(scaleFactor))")
+
+            if let contentRect = detectSimulatorContentRect() {
+                self.deviceScreenRect = contentRect
+                config.sourceRect = contentRect
+                config.width = Int(contentRect.width * scaleFactor)
+                config.height = Int(contentRect.height * scaleFactor)
+                print("[Capture] Cropping to content area: \(contentRect) → \(config.width)x\(config.height)")
+            } else {
+                config.width = Int(size.width * scaleFactor)
+                config.height = Int(size.height * scaleFactor)
+                print("[Capture] Output size: \(config.width)x\(config.height) (scale \(scaleFactor))")
+            }
         }
 
         return config
+    }
+
+    /// Uses macOS Accessibility to find the device screen content area inside
+    /// the Simulator window. Returns a rect in window-local points suitable
+    /// for SCStreamConfiguration.sourceRect, or nil on failure.
+    private func detectSimulatorContentRect() -> CGRect? {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.iphonesimulator"
+        }) else {
+            print("[Capture] Simulator app not found for content rect detection")
+            return nil
+        }
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
+        guard let windows = windowsRef as? [AXUIElement] else { return nil }
+
+        for win in windows {
+            var subroleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXSubroleAttribute as CFString, &subroleRef)
+            guard (subroleRef as? String) == "AXStandardWindow" else { continue }
+
+            // Get window origin in screen coords
+            var winPos = CGPoint.zero
+            var posRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef)
+            if let posRef { AXValueGetValue(posRef as! AXValue, .cgPoint, &winPos) }
+
+            var winSize = CGSize.zero
+            var sizeRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef)
+            if let sizeRef { AXValueGetValue(sizeRef as! AXValue, .cgSize, &winSize) }
+
+            // Find the AXGroup child -- this is the device screen content area
+            var childrenRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXChildrenAttribute as CFString, &childrenRef)
+            guard let children = childrenRef as? [AXUIElement] else { continue }
+
+            for child in children {
+                var roleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef)
+                guard (roleRef as? String) == "AXGroup" else { continue }
+
+                var childPos = CGPoint.zero
+                var cPosRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXPositionAttribute as CFString, &cPosRef)
+                if let cPosRef { AXValueGetValue(cPosRef as! AXValue, .cgPoint, &childPos) }
+
+                var childSize = CGSize.zero
+                var cSizeRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &cSizeRef)
+                if let cSizeRef { AXValueGetValue(cSizeRef as! AXValue, .cgSize, &childSize) }
+
+                guard childSize.width > 0, childSize.height > 0 else { continue }
+
+                let offsetX = childPos.x - winPos.x
+                let offsetY = childPos.y - winPos.y
+                let rect = CGRect(x: offsetX, y: offsetY, width: childSize.width, height: childSize.height)
+                print("[Capture] AX content rect in window: \(rect)  (window \(winSize.width)x\(winSize.height))")
+                return rect
+            }
+        }
+
+        print("[Capture] Could not find content group via Accessibility")
+        return nil
     }
 }
 
