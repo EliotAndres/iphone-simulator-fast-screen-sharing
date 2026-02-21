@@ -7,8 +7,12 @@ final class CaptureManager: NSObject {
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
 
     private var stream: SCStream?
+    private var filter: SCContentFilter?
+    private var streamConfig: SCStreamConfiguration?
     private let streamQueue = DispatchQueue(label: "com.simulatorstream.capture")
     private var lastPixelBuffer: CVPixelBuffer?
+    private var idleTimer: DispatchSourceTimer?
+    private var hasReceivedRealFrame = false
 
     func start() async throws {
         let content: SCShareableContent
@@ -20,10 +24,12 @@ final class CaptureManager: NSObject {
             throw error
         }
 
-        let (filter, windowSize) = try makeFilter(from: content)
+        let (contentFilter, windowSize) = try makeFilter(from: content)
         let config = makeConfiguration(windowSize: windowSize)
+        self.filter = contentFilter
+        self.streamConfig = config
 
-        let captureStream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let captureStream = SCStream(filter: contentFilter, configuration: config, delegate: nil)
         try captureStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: streamQueue)
         try await captureStream.startCapture()
         self.stream = captureStream
@@ -35,12 +41,53 @@ final class CaptureManager: NSObject {
         stream = nil
     }
 
-    /// Push the last captured frame once, so a newly connected client gets an
-    /// image even if the screen is static.
-    func sendLastFrame() {
-        streamQueue.async { [weak self] in
-            guard let self, let buf = self.lastPixelBuffer else { return }
-            self.onFrame?(buf, CMTime(value: Int64(CACurrentMediaTime() * 1000), timescale: 1000))
+    /// Repeatedly push a frame (screenshot or cached) every 500ms until
+    /// SCStream delivers a real frame. Ensures the newly connected WebRTC
+    /// client receives video even when the simulator screen is static.
+    func startIdleFramePump() {
+        stopIdleFramePump()
+        hasReceivedRealFrame = false
+
+        let timer = DispatchSource.makeTimerSource(queue: streamQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.hasReceivedRealFrame else {
+                self?.stopIdleFramePump()
+                return
+            }
+            self.pushOneFrame()
+        }
+        timer.resume()
+        idleTimer = timer
+    }
+
+    private func stopIdleFramePump() {
+        idleTimer?.cancel()
+        idleTimer = nil
+    }
+
+    private func pushOneFrame() {
+        if let buf = lastPixelBuffer {
+            let ts = CMTime(value: Int64(CACurrentMediaTime() * 1000), timescale: 1000)
+            onFrame?(buf, ts)
+            return
+        }
+
+        guard let filter, let config = streamConfig else { return }
+        Task {
+            do {
+                let image = try await SCScreenshotManager.captureSampleBuffer(
+                    contentFilter: filter,
+                    configuration: config
+                )
+                guard let pixelBuffer = image.imageBuffer else { return }
+                self.lastPixelBuffer = pixelBuffer
+                let ts = CMTime(value: Int64(CACurrentMediaTime() * 1000), timescale: 1000)
+                self.onFrame?(pixelBuffer, ts)
+                print("[Capture] Sent screenshot as initial frame")
+            } catch {
+                print("[Capture] Failed to capture screenshot: \(error)")
+            }
         }
     }
 
@@ -99,6 +146,10 @@ extension CaptureManager: SCStreamOutput {
 
         if let pixelBuffer = sampleBuffer.imageBuffer {
             lastPixelBuffer = pixelBuffer
+            if !hasReceivedRealFrame {
+                hasReceivedRealFrame = true
+                stopIdleFramePump()
+            }
             onFrame?(pixelBuffer, timestamp)
         }
     }
