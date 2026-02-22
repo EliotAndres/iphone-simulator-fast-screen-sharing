@@ -222,26 +222,43 @@
 
     video.onerror = () => setStatus('error', 'Video error');
 
-    // Safari's AVFoundation pipeline buffers ahead independently of the WebRTC
-    // jitter buffer, causing 2-3s of lag. Use requestVideoFrameCallback to detect
-    // drift and seek currentTime to the live edge.
+    // Safari's AVFoundation pipeline adds an internal buffer on top of the WebRTC
+    // jitter buffer that is invisible to video.buffered. Detect lag via wall-clock
+    // drift and use playbackRate to catch up smoothly (seeking is unreliable on live
+    // WebRTC streams in Safari and causes re-buffering stalls).
     let liveEdgePursuit = null;
+    let refWallTime = null;
+    let refVideoTime = null;
     function startLiveEdgePursuit() {
       if (liveEdgePursuit) return;
+      refWallTime = null;
+      refVideoTime = null;
       function step() {
         liveEdgePursuit = video.requestVideoFrameCallback(step);
-        if (video.buffered.length === 0) return;
-        const liveEdge = video.buffered.end(video.buffered.length - 1);
-        const lag = liveEdge - video.currentTime;
-        if (lag > 0.15) {
-          console.log(`[Video] Lag ${lag.toFixed(3)}s — seeking to live edge`);
-          video.currentTime = liveEdge;
+        if (refWallTime === null) {
+          refWallTime = performance.now();
+          refVideoTime = video.currentTime;
+          return;
+        }
+        const expectedVideoTime = refVideoTime + (performance.now() - refWallTime) / 1000;
+        const lag = expectedVideoTime - video.currentTime;
+        if (lag > 0.3) {
+          if (video.playbackRate !== 1.08) {
+            console.log(`[Video] Lag ${lag.toFixed(3)}s — speeding up to catch live edge`);
+            video.playbackRate = 1.08;
+          }
+        } else if (lag < 0.05 && video.playbackRate !== 1) {
+          console.log('[Video] Caught up — restoring normal playback rate');
+          video.playbackRate = 1.0;
+          refWallTime = performance.now();
+          refVideoTime = video.currentTime;
         }
       }
       liveEdgePursuit = video.requestVideoFrameCallback(step);
     }
     function stopLiveEdgePursuit() {
       if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
+      video.playbackRate = 1.0;
     }
 
     video.addEventListener('playing', () => { setStatus('streaming', 'Streaming'); startLiveEdgePursuit(); });
