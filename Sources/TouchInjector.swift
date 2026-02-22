@@ -21,10 +21,6 @@ final class TouchInjector {
     /// Device content area height in macOS points.
     private var contentHeightMacOS: Double = 0
 
-    private var touchDownPoint: CGPoint?
-    private var lastMovePoint: CGPoint?
-
-    private static let tapThreshold: Double = 10
 
     init() {
         resolveSimulator()
@@ -66,28 +62,8 @@ final class TouchInjector {
         let point = CGPoint(x: deviceX, y: deviceY)
 
         switch event.type {
-        case "down":
-            touchDownPoint = point
-            lastMovePoint = nil
-        case "move":
-            lastMovePoint = point
-        case "up":
-            guard let start = touchDownPoint else { return }
-            let end = lastMovePoint ?? point
-            let distance = hypot(end.x - start.x, end.y - start.y)
-
-            if distance < Self.tapThreshold {
-                sendBridge(["type": "tap", "x": start.x, "y": start.y])
-            } else {
-                sendBridge([
-                    "type": "swipe",
-                    "x1": start.x, "y1": start.y,
-                    "x2": end.x, "y2": end.y,
-                    "duration": 0.3
-                ])
-            }
-            touchDownPoint = nil
-            lastMovePoint = nil
+        case "down", "move", "up":
+            sendBridge(["type": event.type, "x": point.x, "y": point.y])
         default:
             break
         }
