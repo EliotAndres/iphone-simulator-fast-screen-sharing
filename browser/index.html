@@ -602,7 +602,35 @@
         // addTransceiver is the correct Unified Plan approach for recvonly video.
         // offerToReceiveVideo is a legacy Plan-B hint that Safari ignores.
         if (pc.getTransceivers().length === 0) {
-          pc.addTransceiver('video', { direction: 'recvonly' });
+          const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+
+          // Safari lists H.264 High Profile (640c1f) first in its offer.
+          // The Swift VideoToolbox encoder picks that profile and takes ~7s to
+          // produce the first IDR keyframe in High Profile mode, causing the
+          // massive startup delay seen only in Safari.
+          // Firefox lists Baseline (42e01f) first → Swift picks Baseline → fast.
+          // Fix: use setCodecPreferences to exclude High Profile so both browsers
+          // negotiate Baseline and get the same ~700ms startup time.
+          const caps = RTCRtpReceiver.getCapabilities?.('video');
+          if (caps?.codecs && transceiver.setCodecPreferences) {
+            const filtered = caps.codecs.filter(c => {
+              if (c.mimeType !== 'video/H264') return true;
+              // Drop any H.264 profile where the first nibble is 6x (High, High 4:2:2, etc.)
+              const m = c.sdpFmtpLine?.match(/profile-level-id=([0-9a-f]{6})/i);
+              if (m && parseInt(m[1].slice(0, 2), 16) >= 0x60) return false;
+              return true;
+            });
+            if (filtered.length > 0) {
+              transceiver.setCodecPreferences(filtered);
+              log('codec prefs: excluded H264 High Profile (640c1f)',
+                filtered.filter(c => c.mimeType === 'video/H264').map(c =>
+                  c.sdpFmtpLine?.match(/profile-level-id=\w+/)?.[0] ?? c.mimeType
+                )
+              );
+            }
+          } else {
+            log('codec prefs: setCodecPreferences not available, High Profile may be negotiated');
+          }
         }
         const offer = await pc.createOffer();
         log('SDP offer codecs', parseSdpCodecs(offer.sdp));
