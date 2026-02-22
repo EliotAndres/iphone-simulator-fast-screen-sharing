@@ -88,6 +88,28 @@
     }
     .menu-item:hover { background: rgba(255,255,255,0.1); }
     .menu-item svg { width: 16px; height: 16px; fill: #fff; opacity: 0.7; flex-shrink: 0; }
+    #stats-overlay {
+      position: fixed;
+      bottom: 16px; right: 16px;
+      background: rgba(0,0,0,0.7);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-family: 'SF Mono', 'Menlo', monospace;
+      line-height: 1.6;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+      color: rgba(255,255,255,0.85);
+      display: none;
+    }
+    #stats-overlay.visible { display: block; }
+    #stats-overlay .stat-row { display: flex; justify-content: space-between; gap: 16px; }
+    #stats-overlay .stat-label { color: rgba(255,255,255,0.45); }
+    #stats-overlay .stat-value { text-align: right; }
+    #stats-overlay .lag-ok   { color: #30d158; }
+    #stats-overlay .lag-warn { color: #f0a500; }
+    #stats-overlay .lag-bad  { color: #ff453a; }
   </style>
 </head>
 <body>
@@ -113,12 +135,37 @@
 
   <video id="video" autoplay playsinline muted></video>
 
+  <div id="stats-overlay">
+    <div class="stat-row"><span class="stat-label">wall lag</span><span class="stat-value" id="stat-wall">—</span></div>
+    <div class="stat-row"><span class="stat-label">buffered lag</span><span class="stat-value" id="stat-buf">—</span></div>
+    <div class="stat-row"><span class="stat-label">seeks</span><span class="stat-value" id="stat-seeks">0</span></div>
+    <div class="stat-row"><span class="stat-label">hidden lag</span><span class="stat-value" id="stat-hidden">0</span></div>
+  </div>
+
   <script>
     const video = document.getElementById('video');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
     const settingsBtn = document.getElementById('settings-btn');
     const settingsMenu = document.getElementById('settings-menu');
+    const statsOverlay = document.getElementById('stats-overlay');
+    const statWall = document.getElementById('stat-wall');
+    const statBuf = document.getElementById('stat-buf');
+    const statSeeks = document.getElementById('stat-seeks');
+    const statHidden = document.getElementById('stat-hidden');
+    let seekCount = 0, hiddenCount = 0;
+
+    function lagClass(s) {
+      return s < 0.1 ? 'lag-ok' : s < 0.5 ? 'lag-warn' : 'lag-bad';
+    }
+    function updateStats(wallLag, bufferedLag) {
+      statWall.textContent = (wallLag * 1000).toFixed(0) + ' ms';
+      statWall.className = 'stat-value ' + lagClass(wallLag);
+      statBuf.textContent = (bufferedLag * 1000).toFixed(0) + ' ms';
+      statBuf.className = 'stat-value ' + lagClass(bufferedLag);
+      statSeeks.textContent = seekCount;
+      statHidden.textContent = hiddenCount;
+    }
 
     function setStatus(state, text) {
       statusDot.className = state;
@@ -222,13 +269,32 @@
 
     video.onerror = () => setStatus('error', 'Video error');
 
-    // Safari's AVFoundation pipeline adds an internal buffer on top of the WebRTC
-    // jitter buffer that is invisible to video.buffered. Detect lag via wall-clock
-    // drift and use playbackRate to catch up smoothly (seeking is unreliable on live
-    // WebRTC streams in Safari and causes re-buffering stalls).
+    // Safari problem: during ICE negotiation (slower through a tunnel due to mDNS
+    // candidate resolution), frames pile up in the receive buffer before playback
+    // starts, resulting in 2-3s of lag from frame 1. AVFoundation also adds its own
+    // buffer on top of the WebRTC jitter buffer.
+    //
+    // Fix: seek to the live edge immediately on 'playing', then use wall-clock drift
+    // detection + seeking to keep up. playbackRate is spec-prohibited for live
+    // MediaStream and silently ignored by Safari, so we never use it.
     let liveEdgePursuit = null;
     let refWallTime = null;
     let refVideoTime = null;
+
+    function seekToLiveEdge(reason) {
+      if (video.buffered.length === 0) return;
+      const liveEdge = video.buffered.end(video.buffered.length - 1);
+      const bufferedLag = liveEdge - video.currentTime;
+      if (bufferedLag > 0.05) {
+        video.currentTime = liveEdge;
+        seekCount++;
+        statSeeks.textContent = seekCount;
+      }
+      // Re-anchor wall-clock reference after seek
+      refWallTime = performance.now();
+      refVideoTime = video.currentTime;
+    }
+
     function startLiveEdgePursuit() {
       if (liveEdgePursuit) return;
       refWallTime = null;
@@ -241,27 +307,41 @@
           return;
         }
         const expectedVideoTime = refVideoTime + (performance.now() - refWallTime) / 1000;
-        const lag = expectedVideoTime - video.currentTime;
-        if (lag > 0.3) {
-          if (video.playbackRate !== 1.08) {
-            console.log(`[Video] Lag ${lag.toFixed(3)}s — speeding up to catch live edge`);
-            video.playbackRate = 1.08;
+        const wallLag = expectedVideoTime - video.currentTime;
+        const bufferedLag = video.buffered.length > 0
+          ? video.buffered.end(video.buffered.length - 1) - video.currentTime
+          : 0;
+        updateStats(wallLag, bufferedLag);
+        if (wallLag > 0.3) {
+          if (bufferedLag > 0.05) {
+            // Lag is visible to JS — seek directly
+            seekToLiveEdge(`wall lag ${wallLag.toFixed(2)}s`);
+          } else {
+            // Wall-clock says we're behind but video.buffered doesn't see it:
+            // AVFoundation internal buffer. Re-anchor so we don't spam seeks.
+            hiddenCount++;
+            statHidden.textContent = hiddenCount;
+            refWallTime = performance.now();
+            refVideoTime = video.currentTime;
           }
-        } else if (lag < 0.05 && video.playbackRate !== 1) {
-          console.log('[Video] Caught up — restoring normal playback rate');
-          video.playbackRate = 1.0;
-          refWallTime = performance.now();
-          refVideoTime = video.currentTime;
         }
       }
       liveEdgePursuit = video.requestVideoFrameCallback(step);
     }
     function stopLiveEdgePursuit() {
       if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
-      video.playbackRate = 1.0;
+      statsOverlay.classList.remove('visible');
     }
 
-    video.addEventListener('playing', () => { setStatus('streaming', 'Streaming'); startLiveEdgePursuit(); });
+    video.addEventListener('playing', () => {
+      setStatus('streaming', 'Streaming');
+      statsOverlay.classList.add('visible');
+      seekCount = 0; hiddenCount = 0;
+      // Drain any frames that accumulated during ICE negotiation before seeking
+      // back to live.  A short delay lets Safari populate video.buffered first.
+      setTimeout(() => seekToLiveEdge('initial play'), 200);
+      startLiveEdgePursuit();
+    });
     video.addEventListener('pause',   stopLiveEdgePursuit);
     video.addEventListener('ended',   stopLiveEdgePursuit);
 
