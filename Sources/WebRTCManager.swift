@@ -5,6 +5,7 @@ final class WebRTCManager: NSObject {
     var onIceCandidate: ((RTCIceCandidate) -> Void)?
     var onConnectionStateChange: ((RTCPeerConnectionState) -> Void)?
     var onTouchEvent: ((TouchEvent) -> Void)?
+    var onCommand: ((String) -> Void)?
 
     private let factory: RTCPeerConnectionFactory
     private var peerConnection: RTCPeerConnection?
@@ -217,12 +218,16 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
     }
 }
 
-// MARK: - Data channel (touch events from browser)
+// MARK: - Data channel (touch events and commands from browser)
 
 struct TouchEvent: Codable {
     let type: String   // "down", "move", "up"
     let x: Double      // normalized 0..1
     let y: Double      // normalized 0..1
+}
+
+private struct DataMessage: Codable {
+    let type: String
 }
 
 extension WebRTCManager: RTCDataChannelDelegate {
@@ -232,12 +237,18 @@ extension WebRTCManager: RTCDataChannelDelegate {
 
     func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
         let raw = String(data: buffer.data, encoding: .utf8) ?? "<binary>"
-        print("[WebRTC] Data channel message: \(raw)")
-        guard let event = try? JSONDecoder().decode(TouchEvent.self, from: buffer.data) else {
-            print("[WebRTC] Failed to decode touch event from: \(raw)")
+        guard let msg = try? JSONDecoder().decode(DataMessage.self, from: buffer.data) else {
+            print("[WebRTC] Failed to decode message: \(raw)")
             return
         }
-        print("[WebRTC] Touch event: \(event.type) (\(event.x), \(event.y))")
-        onTouchEvent?(event)
+
+        switch msg.type {
+        case "down", "move", "up":
+            guard let event = try? JSONDecoder().decode(TouchEvent.self, from: buffer.data) else { return }
+            onTouchEvent?(event)
+        default:
+            print("[WebRTC] Command: \(msg.type)")
+            onCommand?(msg.type)
+        }
     }
 }

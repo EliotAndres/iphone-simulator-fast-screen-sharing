@@ -18,6 +18,7 @@ final class StreamingApp {
         Task {
             do {
                 try await captureManager.start()
+                touchInjector.setVideoIsCropped(captureManager.deviceScreenRect != nil)
                 captureManager.onFrame = { [weak self] pixelBuffer, timestamp in
                     self?.webRTCManager.pushFrame(pixelBuffer, timestamp: timestamp)
                 }
@@ -58,6 +59,15 @@ final class StreamingApp {
 
         webRTCManager.onTouchEvent = { [weak self] event in
             self?.touchInjector.handleTouch(event)
+        }
+
+        webRTCManager.onCommand = { [weak self] command in
+            switch command {
+            case "home":
+                self?.touchInjector.pressHome()
+            default:
+                print("[App] Unknown command: \(command)")
+            }
         }
 
         webRTCManager.onConnectionStateChange = { [weak self] state in

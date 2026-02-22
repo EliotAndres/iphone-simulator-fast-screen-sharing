@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 final class TouchInjector {
     private let queue = DispatchQueue(label: "com.simulatorstream.touch", qos: .userInteractive)
@@ -7,6 +8,18 @@ final class TouchInjector {
     private var screenWidth: Double = 0
     private var screenHeight: Double = 0
     private var simulatorUDID: String?
+
+    /// When false, the captured video is the full simulator window (top bar included)
+    /// and touch coordinates must be adjusted. When true, the video is already cropped
+    /// to the device screen and direct mapping is correct.
+    private var videoIsCropped: Bool = true
+
+    /// Top bar height in macOS window points (from Accessibility API).
+    private var topBarOffsetMacOS: Double = 0
+    /// Total simulator window height in macOS points.
+    private var windowHeightMacOS: Double = 0
+    /// Device content area height in macOS points.
+    private var contentHeightMacOS: Double = 0
 
     private var touchDownPoint: CGPoint?
     private var lastMovePoint: CGPoint?
@@ -17,10 +30,40 @@ final class TouchInjector {
         resolveSimulator()
     }
 
+    func pressHome() {
+        queue.async { [weak self] in
+            guard let self, let udid = self.simulatorUDID else {
+                print("[Touch] pressHome: simulator not resolved yet")
+                return
+            }
+            _ = self.shell("xcrun", "simctl", "io", udid, "button", "home")
+            print("[Touch] Home button pressed")
+        }
+    }
+
+    func setVideoIsCropped(_ isCropped: Bool) {
+        queue.async { self.videoIsCropped = isCropped }
+        print("[Touch] Video is \(isCropped ? "cropped to device screen (direct mapping)" : "full window — applying top bar correction")")
+    }
+
     func handleTouch(_ event: TouchEvent) {
         guard screenWidth > 0, screenHeight > 0 else { return }
 
-        let point = CGPoint(x: event.x * screenWidth, y: event.y * screenHeight)
+        let deviceX: Double
+        let deviceY: Double
+
+        if !videoIsCropped && windowHeightMacOS > 0 && contentHeightMacOS > 0 && topBarOffsetMacOS > 0 {
+            // Video frame is the full simulator window (top bar included).
+            // Map through the content rect to get device logical coordinates.
+            let scaleY = screenHeight / contentHeightMacOS
+            deviceX = event.x * screenWidth
+            deviceY = max(0, (event.y * windowHeightMacOS - topBarOffsetMacOS) * scaleY)
+        } else {
+            deviceX = event.x * screenWidth
+            deviceY = event.y * screenHeight
+        }
+
+        let point = CGPoint(x: deviceX, y: deviceY)
 
         switch event.type {
         case "down":
@@ -71,6 +114,15 @@ final class TouchInjector {
                 return
             }
 
+            if let metrics = self.detectWindowMetrics() {
+                self.topBarOffsetMacOS = metrics.topBarOffset
+                self.windowHeightMacOS = metrics.windowHeight
+                self.contentHeightMacOS = metrics.contentHeight
+                print("[Touch] Top bar offset: \(metrics.topBarOffset) pts, window: \(metrics.windowHeight) pts, content: \(metrics.contentHeight) pts")
+            } else {
+                print("[Touch] Could not detect window metrics via Accessibility, using direct mapping")
+            }
+
             let socketPath = "/tmp/idb/\(udid)_companion.sock"
             guard FileManager.default.fileExists(atPath: socketPath) else {
                 print("[Touch] Companion socket not found at \(socketPath)")
@@ -94,7 +146,7 @@ final class TouchInjector {
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/opt/python@3.11/bin/python3.11")
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/opt/python@3.13/bin/python3.13")
         process.arguments = [scriptPath]
         process.environment = ProcessInfo.processInfo.environment.merging(
             ["IDB_COMPANION_SOCKET": socketPath]
@@ -200,6 +252,61 @@ final class TouchInjector {
         let height = (frame["height"] as? Double) ?? Double(frame["height"] as? Int ?? 0)
         guard width > 0, height > 0 else { return nil }
         return CGSize(width: width, height: height)
+    }
+
+    /// Uses macOS Accessibility to find the simulator top bar height and total window height.
+    /// Returns values in macOS window points (same coordinate space as SCStream sourceRect).
+    private func detectWindowMetrics() -> (topBarOffset: Double, windowHeight: Double, contentHeight: Double)? {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.iphonesimulator"
+        }) else { return nil }
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
+        guard let windows = windowsRef as? [AXUIElement] else { return nil }
+
+        for win in windows {
+            var subroleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXSubroleAttribute as CFString, &subroleRef)
+            guard (subroleRef as? String) == "AXStandardWindow" else { continue }
+
+            var winPos = CGPoint.zero
+            var posRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef)
+            if let posRef { AXValueGetValue(posRef as! AXValue, .cgPoint, &winPos) }
+
+            var winSize = CGSize.zero
+            var sizeRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef)
+            if let sizeRef { AXValueGetValue(sizeRef as! AXValue, .cgSize, &winSize) }
+            guard winSize.height > 0 else { continue }
+
+            var childrenRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(win, kAXChildrenAttribute as CFString, &childrenRef)
+            guard let children = childrenRef as? [AXUIElement] else { continue }
+
+            for child in children {
+                var roleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef)
+                guard (roleRef as? String) == "AXGroup" else { continue }
+
+                var childPos = CGPoint.zero
+                var cPosRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXPositionAttribute as CFString, &cPosRef)
+                if let cPosRef { AXValueGetValue(cPosRef as! AXValue, .cgPoint, &childPos) }
+
+                var childSize = CGSize.zero
+                var cSizeRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &cSizeRef)
+                if let cSizeRef { AXValueGetValue(cSizeRef as! AXValue, .cgSize, &childSize) }
+                guard childSize.height > 0 else { continue }
+
+                let topBarOffset = Double(childPos.y - winPos.y)
+                return (topBarOffset: topBarOffset, windowHeight: Double(winSize.height), contentHeight: Double(childSize.height))
+            }
+        }
+        return nil
     }
 
     private func shell(_ command: String, _ args: String...) -> String {

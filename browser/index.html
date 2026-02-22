@@ -48,6 +48,46 @@
       user-select: none;
       -webkit-user-select: none;
     }
+    #settings-btn {
+      position: fixed;
+      top: 16px; left: 16px;
+      width: 36px; height: 36px;
+      background: rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+      transition: background 0.2s;
+    }
+    #settings-btn:hover { background: rgba(255,255,255,0.15); }
+    #settings-btn svg { width: 18px; height: 18px; fill: #fff; opacity: 0.85; }
+    #settings-menu {
+      position: fixed;
+      top: 60px; left: 16px;
+      background: rgba(30,30,30,0.95);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 4px 0;
+      min-width: 140px;
+      z-index: 10;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+      display: none;
+    }
+    #settings-menu.open { display: block; }
+    .menu-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 6px;
+      margin: 2px 4px;
+      transition: background 0.15s;
+    }
+    .menu-item:hover { background: rgba(255,255,255,0.1); }
+    .menu-item svg { width: 16px; height: 16px; fill: #fff; opacity: 0.7; flex-shrink: 0; }
   </style>
 </head>
 <body>
@@ -55,17 +95,52 @@
     <div id="status-dot" class="connecting"></div>
     <span id="status-text">Connecting...</span>
   </div>
+
+  <button id="settings-btn" title="Settings">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 15.5A3.5 3.5 0 0 1 8.5 12 3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5 3.5 3.5 0 0 1-3.5 3.5m7.43-2.92c.04-.34.07-.69.07-1.08s-.03-.74-.07-1.08l2.32-1.82c.21-.16.27-.46.13-.7l-2.2-3.81c-.14-.23-.43-.31-.67-.23l-2.73 1.1c-.57-.44-1.18-.8-1.85-1.08L14.92 2.1c-.04-.26-.27-.46-.54-.46h-4.4c-.27 0-.5.2-.54.46l-.42 2.88c-.67.28-1.29.64-1.85 1.08L4.44 6.06c-.24-.09-.53 0-.67.23L1.57 10.1c-.14.24-.08.54.13.7l2.32 1.82c-.04.34-.06.7-.06 1.08s.02.74.06 1.08L1.7 16.6c-.21.16-.27.46-.13.7l2.2 3.81c.14.23.43.31.67.23l2.73-1.1c.57.44 1.18.8 1.85 1.08l.42 2.88c.04.26.27.46.54.46h4.4c.27 0 .5-.2.54-.46l.42-2.88c.67-.28 1.28-.64 1.85-1.08l2.73 1.1c.24.09.53 0 .67-.23l2.2-3.81c.14-.24.08-.54-.13-.7l-2.32-1.82z"/>
+    </svg>
+  </button>
+
+  <div id="settings-menu">
+    <div class="menu-item" id="menu-home">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/>
+      </svg>
+      Home
+    </div>
+  </div>
+
   <video id="video" autoplay playsinline muted></video>
 
   <script>
     const video = document.getElementById('video');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
+    const settingsBtn = document.getElementById('settings-btn');
+    const settingsMenu = document.getElementById('settings-menu');
 
     function setStatus(state, text) {
       statusDot.className = state;
       statusText.textContent = text;
     }
+
+    // Settings menu toggle
+    settingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      settingsMenu.classList.toggle('open');
+    });
+    document.addEventListener('click', () => settingsMenu.classList.remove('open'));
+
+    function sendCommand(type) {
+      if (touchChannel.readyState !== 'open') return;
+      touchChannel.send(JSON.stringify({ type }));
+    }
+
+    document.getElementById('menu-home').addEventListener('click', () => {
+      sendCommand('home');
+      settingsMenu.classList.remove('open');
+    });
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
