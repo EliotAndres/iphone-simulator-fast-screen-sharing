@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <title>iOS Simulator Stream</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -181,9 +181,26 @@
       touchChannel.send(JSON.stringify({ type, x, y }));
     }
 
+    // Throttle move events to one per animation frame
+    let pendingMove = null;
+    let moveRafPending = false;
+    function queueMove(clientX, clientY) {
+      pendingMove = { clientX, clientY };
+      if (!moveRafPending) {
+        moveRafPending = true;
+        requestAnimationFrame(() => {
+          moveRafPending = false;
+          if (pendingMove) {
+            sendTouch('move', pendingMove.clientX, pendingMove.clientY);
+            pendingMove = null;
+          }
+        });
+      }
+    }
+
     // Mouse events
     video.addEventListener('mousedown', (e) => { e.preventDefault(); sendTouch('down', e.clientX, e.clientY); });
-    video.addEventListener('mousemove', (e) => { if (e.buttons & 1) sendTouch('move', e.clientX, e.clientY); });
+    video.addEventListener('mousemove', (e) => { if (e.buttons & 1) queueMove(e.clientX, e.clientY); });
     video.addEventListener('mouseup',   (e) => { sendTouch('up', e.clientX, e.clientY); });
 
     // Touch events (mobile / tablet)
@@ -195,7 +212,7 @@
     video.addEventListener('touchmove', (e) => {
       e.preventDefault();
       const t = e.touches[0];
-      sendTouch('move', t.clientX, t.clientY);
+      queueMove(t.clientX, t.clientY);
     });
     video.addEventListener('touchend', (e) => {
       e.preventDefault();
@@ -207,6 +224,12 @@
     video.onerror   = () => setStatus('error', 'Video error');
 
     pc.ontrack = (event) => {
+      // Minimize jitter buffer delay (Safari 16+, Chrome 107+).
+      // Safari defaults to ~150-200ms; setting 0 tells it to play as soon as possible.
+      if (event.receiver?.jitterBufferTarget !== undefined) {
+        event.receiver.jitterBufferTarget = 0;
+      }
+
       // Safari bug: event.streams may be empty even when a track arrives.
       // Work around by building a MediaStream manually from the track.
       let stream = (event.streams && event.streams[0]) || null;
