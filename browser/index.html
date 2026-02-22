@@ -119,6 +119,34 @@
     const statusText = document.getElementById('status-text');
     const settingsBtn = document.getElementById('settings-btn');
     const settingsMenu = document.getElementById('settings-menu');
+    // ─── Timing helpers ───────────────────────────────────────────────────────
+    const T0 = performance.now();
+    function ts() { return ((performance.now() - T0) / 1000).toFixed(3) + 's'; }
+    function log(label, ...args) { console.log(`[${ts()}] ${label}`, ...args); }
+
+    // ─── Environment ──────────────────────────────────────────────────────────
+    log('ENV browser', navigator.userAgent);
+    log('ENV origin', location.origin);
+    log('ENV RTCPeerConnection', typeof RTCPeerConnection);
+    log('ENV requestVideoFrameCallback', typeof video.requestVideoFrameCallback);
+    log('ENV jitterBufferTarget (RTCRtpReceiver)', 'jitterBufferTarget' in RTCRtpReceiver.prototype ? 'supported' : 'NOT supported');
+
+    // ─── SDP codec parser ─────────────────────────────────────────────────────
+    function parseSdpCodecs(sdp) {
+      const codecs = [];
+      const lines = sdp.split('\n');
+      const payloadMap = {};
+      lines.forEach(l => {
+        const m = l.match(/^a=rtpmap:(\d+)\s+(\S+)/);
+        if (m) payloadMap[m[1]] = m[2];
+      });
+      lines.forEach(l => {
+        const m = l.match(/^a=fmtp:(\d+)\s+(.+)/);
+        if (m && payloadMap[m[1]]) codecs.push(`${payloadMap[m[1]]} [${m[2].trim()}]`);
+      });
+      if (codecs.length === 0) Object.values(payloadMap).forEach(v => codecs.push(v));
+      return codecs;
+    }
 
     function setStatus(state, text) {
       statusDot.className = state;
@@ -146,10 +174,105 @@
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
 
+    // ─── ICE / connection state logging ───────────────────────────────────────
+    pc.onicecandidate = (event) => {
+      if (event.candidate && event.candidate.candidate) {
+        const c = event.candidate.candidate;
+        const isMdns = c.includes('.local');
+        const typeMatch = c.match(/typ (\w+)/);
+        const protoMatch = c.match(/(\w+) \d+ \w+ \d+ /);
+        log('ICE local candidate',
+          `type=${typeMatch?.[1] ?? '?'}`,
+          `proto=${event.candidate.protocol ?? '?'}`,
+          isMdns ? '⚠️ mDNS (.local)' : '',
+          c.slice(0, 80));
+        ws.send(JSON.stringify({
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          sdpMid: event.candidate.sdpMid
+        }));
+      } else if (!event.candidate) {
+        log('ICE gathering complete');
+      }
+    };
+
+    pc.onicegatheringstatechange = () => log('ICE gathering state', pc.iceGatheringState);
+    pc.oniceconnectionstatechange = () => log('ICE connection state', pc.iceConnectionState);
+    pc.onsignalingstatechange = () => log('Signaling state', pc.signalingState);
+    pc.onconnectionstatechange = () => {
+      log('Peer connection state', pc.connectionState);
+      if (pc.connectionState === 'failed') setStatus('error', 'Connection failed');
+      if (pc.connectionState === 'connected') {
+        logSelectedCandidatePair();
+        startStatsPolling();
+      }
+    };
+
+    async function logSelectedCandidatePair() {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach(r => {
+          if (r.type === 'candidate-pair' && r.nominated) {
+            const local  = stats.get(r.localCandidateId);
+            const remote = stats.get(r.remoteCandidateId);
+            log('ICE selected pair',
+              `local=${local?.candidateType}/${local?.protocol} ${local?.address ?? local?.ip ?? '?'}:${local?.port ?? '?'}`,
+              `remote=${remote?.candidateType}/${remote?.protocol} ${remote?.address ?? remote?.ip ?? '?'}:${remote?.port ?? '?'}`,
+              `RTT=${r.currentRoundTripTime != null ? (r.currentRoundTripTime * 1000).toFixed(1) + 'ms' : '?'}`
+            );
+          }
+        });
+      } catch(e) { log('ICE getStats error', e.message); }
+    }
+
+    // Periodic stats: jitter buffer, codec, RTT, packet loss
+    let statsInterval = null;
+    let prevStats = {};
+    function startStatsPolling() {
+      if (statsInterval) return;
+      statsInterval = setInterval(async () => {
+        try {
+          const stats = await pc.getStats();
+          const codecMap = {};
+          stats.forEach(r => { if (r.type === 'codec') codecMap[r.id] = r; });
+
+          stats.forEach(r => {
+            if (r.type === 'inbound-rtp' && r.kind === 'video') {
+              const codec = codecMap[r.codecId];
+              const jbDelay = r.jitterBufferDelay != null && r.jitterBufferEmittedCount
+                ? (r.jitterBufferDelay / r.jitterBufferEmittedCount * 1000).toFixed(1) + 'ms'
+                : '?';
+              const prev = prevStats[r.id] || {};
+              const fps = prev.framesDecoded != null
+                ? ((r.framesDecoded - prev.framesDecoded) / 2).toFixed(1) + 'fps'
+                : '?';
+              log('STATS inbound-rtp',
+                `codec=${codec?.mimeType ?? '?'}`,
+                `jitterBufDelay=${jbDelay}`,
+                `jitter=${r.jitter != null ? (r.jitter * 1000).toFixed(1) + 'ms' : '?'}`,
+                `lost=${r.packetsLost ?? '?'}`,
+                `fps≈${fps}`,
+                `framesDropped=${r.framesDropped ?? '?'}`,
+                `nackCount=${r.nackCount ?? '?'}`
+              );
+              prevStats[r.id] = { framesDecoded: r.framesDecoded };
+            }
+            if (r.type === 'candidate-pair' && r.nominated) {
+              log('STATS candidate-pair',
+                `RTT=${r.currentRoundTripTime != null ? (r.currentRoundTripTime * 1000).toFixed(1) + 'ms' : '?'}`,
+                `available bw=${r.availableOutgoingBitrate != null ? (r.availableOutgoingBitrate / 1000).toFixed(0) + 'kbps' : '?'}`
+              );
+            }
+          });
+        } catch(e) { log('STATS error', e.message); }
+      }, 2000);
+    }
+
     // Data channel for sending touch/mouse events to the streamer
     const touchChannel = pc.createDataChannel('touch', { ordered: true });
-    touchChannel.onopen = () => console.log('[Touch] Data channel open');
-    touchChannel.onclose = () => console.log('[Touch] Data channel closed');
+    touchChannel.onopen = () => log('Touch data channel open');
+    touchChannel.onclose = () => log('Touch data channel closed');
 
     function sendTouch(type, clientX, clientY) {
       if (touchChannel.readyState !== 'open') return;
@@ -220,65 +343,44 @@
       sendTouch('up', t.clientX, t.clientY);
     });
 
-    video.onerror = () => setStatus('error', 'Video error');
+    // ─── Video element lifecycle logging ──────────────────────────────────────
+    ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','waiting','stalled'].forEach(evt => {
+      video.addEventListener(evt, () => log(`video:${evt}`,
+        `currentTime=${video.currentTime.toFixed(3)}`,
+        `readyState=${video.readyState}`,
+        `buffered ranges=${video.buffered.length}`,
+        video.buffered.length ? `[0..${video.buffered.end(video.buffered.length-1).toFixed(3)}]` : ''
+      ));
+    });
+    video.addEventListener('loadedmetadata', () =>
+      log('video:resolution', `${video.videoWidth}x${video.videoHeight}`)
+    );
+    video.onerror = (e) => { log('video:error', video.error); setStatus('error', 'Video error'); };
 
-    // Safari's AVFoundation pipeline adds an internal buffer on top of the WebRTC
-    // jitter buffer that is invisible to video.buffered. Detect lag via wall-clock
-    // drift and use playbackRate to catch up smoothly (seeking is unreliable on live
-    // WebRTC streams in Safari and causes re-buffering stalls).
-    let liveEdgePursuit = null;
-    let refWallTime = null;
-    let refVideoTime = null;
-    function startLiveEdgePursuit() {
-      if (liveEdgePursuit) return;
-      refWallTime = null;
-      refVideoTime = null;
-      function step() {
-        liveEdgePursuit = video.requestVideoFrameCallback(step);
-        if (refWallTime === null) {
-          refWallTime = performance.now();
-          refVideoTime = video.currentTime;
-          return;
-        }
-        const expectedVideoTime = refVideoTime + (performance.now() - refWallTime) / 1000;
-        const lag = expectedVideoTime - video.currentTime;
-        if (lag > 0.3) {
-          if (video.playbackRate !== 1.08) {
-            console.log(`[Video] Lag ${lag.toFixed(3)}s — speeding up to catch live edge`);
-            video.playbackRate = 1.08;
-          }
-        } else if (lag < 0.05 && video.playbackRate !== 1) {
-          console.log('[Video] Caught up — restoring normal playback rate');
-          video.playbackRate = 1.0;
-          refWallTime = performance.now();
-          refVideoTime = video.currentTime;
-        }
-      }
-      liveEdgePursuit = video.requestVideoFrameCallback(step);
-    }
-    function stopLiveEdgePursuit() {
-      if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
-      video.playbackRate = 1.0;
-    }
-
-    video.addEventListener('playing', () => { setStatus('streaming', 'Streaming'); startLiveEdgePursuit(); });
-    video.addEventListener('pause',   stopLiveEdgePursuit);
-    video.addEventListener('ended',   stopLiveEdgePursuit);
+    video.addEventListener('playing', () => {
+      setStatus('streaming', 'Streaming');
+      const bufferedAtPlay = video.buffered.length > 0
+        ? video.buffered.end(video.buffered.length - 1).toFixed(3)
+        : 'none';
+      log('video:playing', `currentTime=${video.currentTime.toFixed(3)}`, `buffered end=${bufferedAtPlay}s`);
+    });
 
     pc.ontrack = (event) => {
-      // Minimize jitter buffer delay (Safari 16+, Chrome 107+).
-      // Safari defaults to ~150-200ms; setting 0 tells it to play as soon as possible.
-      if (event.receiver?.jitterBufferTarget !== undefined) {
-        event.receiver.jitterBufferTarget = 0;
+      log('ontrack', `kind=${event.track.kind}`, `id=${event.track.id}`, `streams=${event.streams.length}`);
+
+      // Log receiver capabilities
+      if (event.receiver?.getParameters) {
+        const params = event.receiver.getParameters();
+        log('ontrack receiver codecs', params.codecs?.map(c => `${c.mimeType}/${c.clockRate}`).join(', ') || 'none');
       }
 
       // Safari bug: event.streams may be empty even when a track arrives.
-      // Work around by building a MediaStream manually from the track.
       let stream = (event.streams && event.streams[0]) || null;
-      if (!stream) stream = new MediaStream([event.track]);
+      if (!stream) { stream = new MediaStream([event.track]); log('ontrack built MediaStream manually'); }
 
       video.srcObject = stream;
-      video.play().catch(() => {
+      video.play().catch((e) => {
+        log('video.play() blocked', e.message, '— waiting for user gesture');
         setStatus('connecting', 'Tap to play');
         document.body.addEventListener('click', () => video.play(), { once: true });
       });
@@ -301,8 +403,10 @@
 
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+    log('WS connecting to', `${wsProto}//${location.host}/ws`);
 
     ws.onopen = () => {
+      log('WS open');
       ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));
       setStatus('connecting', 'Waiting for streamer...');
     };
@@ -310,39 +414,77 @@
     ws.onmessage = async (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
+      log('WS recv', msg.type);
 
       if (msg.type === 'streamer-ready') {
         setStatus('connecting', 'Negotiating...');
         await createAndSendOffer();
       } else if (msg.type === 'answer') {
         try {
+          log('SDP answer codecs', parseSdpCodecs(msg.sdp));
           await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-        } catch { setStatus('error', 'Negotiation failed'); }
+          log('setRemoteDescription done');
+        } catch(e) { log('setRemoteDescription failed', e.message); setStatus('error', 'Negotiation failed'); }
       } else if (msg.type === 'ice-candidate') {
         if (!msg.candidate) return;
+        const isMdns = msg.candidate.includes('.local');
+        const typeMatch = msg.candidate.match(/typ (\w+)/);
+        log('ICE remote candidate', `type=${typeMatch?.[1] ?? '?'}`, isMdns ? '⚠️ mDNS' : '', msg.candidate.slice(0, 80));
         try {
           await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex, sdpMid: msg.sdpMid });
         } catch { /* ignore stale candidates */ }
       } else if (msg.type === 'streamer-disconnected') {
+        log('Streamer disconnected');
         setStatus('error', 'Streamer disconnected');
         video.srcObject = null;
       }
     };
 
-    ws.onerror = () => setStatus('error', 'Signaling unreachable');
-    ws.onclose = () => setStatus('error', 'WS closed');
+    ws.onerror = (e) => { log('WS error', e); setStatus('error', 'Signaling unreachable'); };
+    ws.onclose = (e) => { log('WS closed', `code=${e.code}`); setStatus('error', 'WS closed'); };
 
     async function createAndSendOffer() {
       try {
         // addTransceiver is the correct Unified Plan approach for recvonly video.
         // offerToReceiveVideo is a legacy Plan-B hint that Safari ignores.
         if (pc.getTransceivers().length === 0) {
-          pc.addTransceiver('video', { direction: 'recvonly' });
+          const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+
+          // Safari lists H.264 High Profile (640c1f) first in its offer.
+          // The Swift VideoToolbox encoder picks that profile and takes ~7s to
+          // produce the first IDR keyframe in High Profile mode, causing the
+          // massive startup delay seen only in Safari.
+          // Firefox lists Baseline (42e01f) first → Swift picks Baseline → fast.
+          // Fix: use setCodecPreferences to exclude High Profile so both browsers
+          // negotiate Baseline and get the same ~700ms startup time.
+          const caps = RTCRtpReceiver.getCapabilities?.('video');
+          if (caps?.codecs && transceiver.setCodecPreferences) {
+            const filtered = caps.codecs.filter(c => {
+              if (c.mimeType !== 'video/H264') return true;
+              // Drop any H.264 profile where the first nibble is 6x (High, High 4:2:2, etc.)
+              const m = c.sdpFmtpLine?.match(/profile-level-id=([0-9a-f]{6})/i);
+              if (m && parseInt(m[1].slice(0, 2), 16) >= 0x60) return false;
+              return true;
+            });
+            if (filtered.length > 0) {
+              transceiver.setCodecPreferences(filtered);
+              log('codec prefs: excluded H264 High Profile (640c1f)',
+                filtered.filter(c => c.mimeType === 'video/H264').map(c =>
+                  c.sdpFmtpLine?.match(/profile-level-id=\w+/)?.[0] ?? c.mimeType
+                )
+              );
+            }
+          } else {
+            log('codec prefs: setCodecPreferences not available, High Profile may be negotiated');
+          }
         }
         const offer = await pc.createOffer();
+        log('SDP offer codecs', parseSdpCodecs(offer.sdp));
         await pc.setLocalDescription(offer);
+        log('offer sent');
         ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
-      } catch {
+      } catch(e) {
+        log('createOffer failed', e.message);
         setStatus('error', 'Offer failed');
       }
     }
