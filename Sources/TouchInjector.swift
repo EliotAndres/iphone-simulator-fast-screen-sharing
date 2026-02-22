@@ -36,8 +36,8 @@ final class TouchInjector {
                 print("[Touch] pressHome: simulator not resolved yet")
                 return
             }
-            _ = self.shell("xcrun", "simctl", "io", udid, "button", "home")
-            print("[Touch] Home button pressed")
+            let output = self.shell("idb", "ui", "button", "HOME", "--udid", udid)
+            print("[Touch] Home button: \(output.isEmpty ? "ok" : output)")
         }
     }
 
@@ -145,15 +145,22 @@ final class TouchInjector {
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/opt/python@3.13/bin/python3.13")
+        guard let pythonPath = resolvePython() else {
+            print("[Touch] Could not find python3 executable")
+            return
+        }
+        print("[Touch] Starting bridge: \(pythonPath) \(scriptPath)")
+        print("[Touch] IDB_COMPANION_SOCKET=\(socketPath)")
+        process.executableURL = URL(fileURLWithPath: pythonPath)
         process.arguments = [scriptPath]
         process.environment = ProcessInfo.processInfo.environment.merging(
             ["IDB_COMPANION_SOCKET": socketPath]
         ) { _, new in new }
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrPipe
 
         do {
             try process.run()
@@ -165,13 +172,23 @@ final class TouchInjector {
         self.bridgeProcess = process
         self.bridgeStdin = stdinPipe.fileHandleForWriting
 
-        // Read the "ready" line
         let outHandle = stdoutPipe.fileHandleForReading
+        let errHandle = stderrPipe.fileHandleForReading
+
+        // Stream stdout
         DispatchQueue.global(qos: .utility).async {
             while let line = self.readLine(from: outHandle) {
-                print("[Touch] Bridge: \(line)")
+                print("[Touch] Bridge stdout: \(line)")
             }
-            print("[Touch] Bridge process exited")
+            process.waitUntilExit()
+            print("[Touch] Bridge process exited (code \(process.terminationStatus), reason \(process.terminationReason.rawValue))")
+        }
+
+        // Stream stderr
+        DispatchQueue.global(qos: .utility).async {
+            while let line = self.readLine(from: errHandle) {
+                print("[Touch] Bridge stderr: \(line)")
+            }
         }
 
         print("[Touch] Bridge started (pid \(process.processIdentifier))")
@@ -306,6 +323,23 @@ final class TouchInjector {
                 return (topBarOffset: topBarOffset, windowHeight: Double(winSize.height), contentHeight: Double(childSize.height))
             }
         }
+        return nil
+    }
+
+    /// Returns the python interpreter from the uv-managed venv created by install.sh.
+    private func resolvePython() -> String? {
+        let fm = FileManager.default
+        let candidates = [
+            "scripts/.venv/bin/python",
+            URL(fileURLWithPath: CommandLine.arguments[0])
+                .deletingLastPathComponent()
+                .appendingPathComponent("../../../scripts/.venv/bin/python")
+                .standardized.path
+        ]
+        for path in candidates where fm.fileExists(atPath: path) {
+            return path
+        }
+        print("[Touch] venv not found. Run install.sh first.")
         return nil
     }
 
