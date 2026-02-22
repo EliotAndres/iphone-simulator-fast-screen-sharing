@@ -155,6 +155,35 @@
     const statHidden = document.getElementById('stat-hidden');
     let seekCount = 0, hiddenCount = 0;
 
+    // ─── Timing helpers ───────────────────────────────────────────────────────
+    const T0 = performance.now();
+    function ts() { return ((performance.now() - T0) / 1000).toFixed(3) + 's'; }
+    function log(label, ...args) { console.log(`[${ts()}] ${label}`, ...args); }
+
+    // ─── Environment ──────────────────────────────────────────────────────────
+    log('ENV browser', navigator.userAgent);
+    log('ENV origin', location.origin);
+    log('ENV RTCPeerConnection', typeof RTCPeerConnection);
+    log('ENV requestVideoFrameCallback', typeof video.requestVideoFrameCallback);
+    log('ENV jitterBufferTarget (RTCRtpReceiver)', 'jitterBufferTarget' in RTCRtpReceiver.prototype ? 'supported' : 'NOT supported');
+
+    // ─── SDP codec parser ─────────────────────────────────────────────────────
+    function parseSdpCodecs(sdp) {
+      const codecs = [];
+      const lines = sdp.split('\n');
+      const payloadMap = {};
+      lines.forEach(l => {
+        const m = l.match(/^a=rtpmap:(\d+)\s+(\S+)/);
+        if (m) payloadMap[m[1]] = m[2];
+      });
+      lines.forEach(l => {
+        const m = l.match(/^a=fmtp:(\d+)\s+(.+)/);
+        if (m && payloadMap[m[1]]) codecs.push(`${payloadMap[m[1]]} [${m[2].trim()}]`);
+      });
+      if (codecs.length === 0) Object.values(payloadMap).forEach(v => codecs.push(v));
+      return codecs;
+    }
+
     function lagClass(s) {
       return s < 0.1 ? 'lag-ok' : s < 0.5 ? 'lag-warn' : 'lag-bad';
     }
@@ -193,10 +222,105 @@
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
 
+    // ─── ICE / connection state logging ───────────────────────────────────────
+    pc.onicecandidate = (event) => {
+      if (event.candidate && event.candidate.candidate) {
+        const c = event.candidate.candidate;
+        const isMdns = c.includes('.local');
+        const typeMatch = c.match(/typ (\w+)/);
+        const protoMatch = c.match(/(\w+) \d+ \w+ \d+ /);
+        log('ICE local candidate',
+          `type=${typeMatch?.[1] ?? '?'}`,
+          `proto=${event.candidate.protocol ?? '?'}`,
+          isMdns ? '⚠️ mDNS (.local)' : '',
+          c.slice(0, 80));
+        ws.send(JSON.stringify({
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          sdpMid: event.candidate.sdpMid
+        }));
+      } else if (!event.candidate) {
+        log('ICE gathering complete');
+      }
+    };
+
+    pc.onicegatheringstatechange = () => log('ICE gathering state', pc.iceGatheringState);
+    pc.oniceconnectionstatechange = () => log('ICE connection state', pc.iceConnectionState);
+    pc.onsignalingstatechange = () => log('Signaling state', pc.signalingState);
+    pc.onconnectionstatechange = () => {
+      log('Peer connection state', pc.connectionState);
+      if (pc.connectionState === 'failed') setStatus('error', 'Connection failed');
+      if (pc.connectionState === 'connected') {
+        logSelectedCandidatePair();
+        startStatsPolling();
+      }
+    };
+
+    async function logSelectedCandidatePair() {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach(r => {
+          if (r.type === 'candidate-pair' && r.nominated) {
+            const local  = stats.get(r.localCandidateId);
+            const remote = stats.get(r.remoteCandidateId);
+            log('ICE selected pair',
+              `local=${local?.candidateType}/${local?.protocol} ${local?.address ?? local?.ip ?? '?'}:${local?.port ?? '?'}`,
+              `remote=${remote?.candidateType}/${remote?.protocol} ${remote?.address ?? remote?.ip ?? '?'}:${remote?.port ?? '?'}`,
+              `RTT=${r.currentRoundTripTime != null ? (r.currentRoundTripTime * 1000).toFixed(1) + 'ms' : '?'}`
+            );
+          }
+        });
+      } catch(e) { log('ICE getStats error', e.message); }
+    }
+
+    // Periodic stats: jitter buffer, codec, RTT, packet loss
+    let statsInterval = null;
+    let prevStats = {};
+    function startStatsPolling() {
+      if (statsInterval) return;
+      statsInterval = setInterval(async () => {
+        try {
+          const stats = await pc.getStats();
+          const codecMap = {};
+          stats.forEach(r => { if (r.type === 'codec') codecMap[r.id] = r; });
+
+          stats.forEach(r => {
+            if (r.type === 'inbound-rtp' && r.kind === 'video') {
+              const codec = codecMap[r.codecId];
+              const jbDelay = r.jitterBufferDelay != null && r.jitterBufferEmittedCount
+                ? (r.jitterBufferDelay / r.jitterBufferEmittedCount * 1000).toFixed(1) + 'ms'
+                : '?';
+              const prev = prevStats[r.id] || {};
+              const fps = prev.framesDecoded != null
+                ? ((r.framesDecoded - prev.framesDecoded) / 2).toFixed(1) + 'fps'
+                : '?';
+              log('STATS inbound-rtp',
+                `codec=${codec?.mimeType ?? '?'}`,
+                `jitterBufDelay=${jbDelay}`,
+                `jitter=${r.jitter != null ? (r.jitter * 1000).toFixed(1) + 'ms' : '?'}`,
+                `lost=${r.packetsLost ?? '?'}`,
+                `fps≈${fps}`,
+                `framesDropped=${r.framesDropped ?? '?'}`,
+                `nackCount=${r.nackCount ?? '?'}`
+              );
+              prevStats[r.id] = { framesDecoded: r.framesDecoded };
+            }
+            if (r.type === 'candidate-pair' && r.nominated) {
+              log('STATS candidate-pair',
+                `RTT=${r.currentRoundTripTime != null ? (r.currentRoundTripTime * 1000).toFixed(1) + 'ms' : '?'}`,
+                `available bw=${r.availableOutgoingBitrate != null ? (r.availableOutgoingBitrate / 1000).toFixed(0) + 'kbps' : '?'}`
+              );
+            }
+          });
+        } catch(e) { log('STATS error', e.message); }
+      }, 2000);
+    }
+
     // Data channel for sending touch/mouse events to the streamer
     const touchChannel = pc.createDataChannel('touch', { ordered: true });
-    touchChannel.onopen = () => console.log('[Touch] Data channel open');
-    touchChannel.onclose = () => console.log('[Touch] Data channel closed');
+    touchChannel.onopen = () => log('Touch data channel open');
+    touchChannel.onclose = () => log('Touch data channel closed');
 
     function sendTouch(type, clientX, clientY) {
       if (touchChannel.readyState !== 'open') return;
@@ -267,7 +391,19 @@
       sendTouch('up', t.clientX, t.clientY);
     });
 
-    video.onerror = () => setStatus('error', 'Video error');
+    // ─── Video element lifecycle logging ──────────────────────────────────────
+    ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','waiting','stalled'].forEach(evt => {
+      video.addEventListener(evt, () => log(`video:${evt}`,
+        `currentTime=${video.currentTime.toFixed(3)}`,
+        `readyState=${video.readyState}`,
+        `buffered ranges=${video.buffered.length}`,
+        video.buffered.length ? `[0..${video.buffered.end(video.buffered.length-1).toFixed(3)}]` : ''
+      ));
+    });
+    video.addEventListener('loadedmetadata', () =>
+      log('video:resolution', `${video.videoWidth}x${video.videoHeight}`)
+    );
+    video.onerror = (e) => { log('video:error', video.error); setStatus('error', 'Video error'); };
 
     // Safari problem: during ICE negotiation (slower through a tunnel due to mDNS
     // candidate resolution), frames pile up in the receive buffer before playback
@@ -282,10 +418,11 @@
     let refVideoTime = null;
 
     function seekToLiveEdge(reason) {
-      if (video.buffered.length === 0) return;
+      if (video.buffered.length === 0) { log('seekToLiveEdge: no buffered data', reason); return; }
       const liveEdge = video.buffered.end(video.buffered.length - 1);
       const bufferedLag = liveEdge - video.currentTime;
       if (bufferedLag > 0.05) {
+        log('seekToLiveEdge', reason, `lag=${(bufferedLag*1000).toFixed(0)}ms → seeking to ${liveEdge.toFixed(3)}s`);
         video.currentTime = liveEdge;
         seekCount++;
         statSeeks.textContent = seekCount;
@@ -295,12 +432,31 @@
       refVideoTime = video.currentTime;
     }
 
+    let firstFrameLogged = false;
     function startLiveEdgePursuit() {
       if (liveEdgePursuit) return;
       refWallTime = null;
       refVideoTime = null;
-      function step() {
+      firstFrameLogged = false;
+      function step(now, metadata) {
         liveEdgePursuit = video.requestVideoFrameCallback(step);
+
+        // Log first frame metadata — key for comparing Safari vs Firefox
+        if (!firstFrameLogged && metadata) {
+          firstFrameLogged = true;
+          log('FRAME first frame metadata',
+            `presentationTime=${metadata.presentationTime?.toFixed(3) ?? '?'}`,
+            `expectedDisplayTime=${metadata.expectedDisplayTime?.toFixed(3) ?? '?'}`,
+            `mediaTime=${metadata.mediaTime?.toFixed(3) ?? '?'}`,
+            `captureTime=${metadata.captureTime?.toFixed(3) ?? '?'}`,
+            `receiveTime=${metadata.receiveTime?.toFixed(3) ?? '?'}`,
+            `width=${metadata.width}x${metadata.height}`
+          );
+          log('FRAME first frame video.currentTime', video.currentTime.toFixed(3),
+            `buffered=${video.buffered.length > 0 ? video.buffered.end(video.buffered.length-1).toFixed(3) : 'none'}`
+          );
+        }
+
         if (refWallTime === null) {
           refWallTime = performance.now();
           refVideoTime = video.currentTime;
@@ -319,6 +475,8 @@
           } else {
             // Wall-clock says we're behind but video.buffered doesn't see it:
             // AVFoundation internal buffer. Re-anchor so we don't spam seeks.
+            if (hiddenCount % 30 === 0)
+              log('hidden lag (AVFoundation?)', `wall=${wallLag.toFixed(2)}s buffered=${bufferedLag.toFixed(2)}s`);
             hiddenCount++;
             statHidden.textContent = hiddenCount;
             refWallTime = performance.now();
@@ -331,12 +489,17 @@
     function stopLiveEdgePursuit() {
       if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
       statsOverlay.classList.remove('visible');
+      if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     }
 
     video.addEventListener('playing', () => {
       setStatus('streaming', 'Streaming');
       statsOverlay.classList.add('visible');
       seekCount = 0; hiddenCount = 0;
+      const bufferedAtPlay = video.buffered.length > 0
+        ? video.buffered.end(video.buffered.length - 1).toFixed(3)
+        : 'none';
+      log('video:playing', `currentTime=${video.currentTime.toFixed(3)}`, `buffered end=${bufferedAtPlay}s`);
       // Drain any frames that accumulated during ICE negotiation before seeking
       // back to live.  A short delay lets Safari populate video.buffered first.
       setTimeout(() => seekToLiveEdge('initial play'), 200);
@@ -346,19 +509,32 @@
     video.addEventListener('ended',   stopLiveEdgePursuit);
 
     pc.ontrack = (event) => {
+      log('ontrack', `kind=${event.track.kind}`, `id=${event.track.id}`,
+        `streams=${event.streams.length}`,
+        `jitterBufferTarget supported=${event.receiver?.jitterBufferTarget !== undefined}`
+      );
+
       // Minimize jitter buffer delay (Safari 16+, Chrome 107+).
-      // Safari defaults to ~150-200ms; setting 0 tells it to play as soon as possible.
       if (event.receiver?.jitterBufferTarget !== undefined) {
         event.receiver.jitterBufferTarget = 0;
+        log('ontrack jitterBufferTarget set to 0');
+      } else {
+        log('ontrack jitterBufferTarget NOT supported in this browser');
+      }
+
+      // Log receiver capabilities
+      if (event.receiver?.getParameters) {
+        const params = event.receiver.getParameters();
+        log('ontrack receiver codecs', params.codecs?.map(c => `${c.mimeType}/${c.clockRate}`).join(', ') || 'none');
       }
 
       // Safari bug: event.streams may be empty even when a track arrives.
-      // Work around by building a MediaStream manually from the track.
       let stream = (event.streams && event.streams[0]) || null;
-      if (!stream) stream = new MediaStream([event.track]);
+      if (!stream) { stream = new MediaStream([event.track]); log('ontrack built MediaStream manually'); }
 
       video.srcObject = stream;
-      video.play().catch(() => {
+      video.play().catch((e) => {
+        log('video.play() blocked', e.message, '— waiting for user gesture');
         setStatus('connecting', 'Tap to play');
         document.body.addEventListener('click', () => video.play(), { once: true });
       });
@@ -381,8 +557,10 @@
 
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+    log('WS connecting to', `${wsProto}//${location.host}/ws`);
 
     ws.onopen = () => {
+      log('WS open');
       ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));
       setStatus('connecting', 'Waiting for streamer...');
     };
@@ -390,27 +568,34 @@
     ws.onmessage = async (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
+      log('WS recv', msg.type);
 
       if (msg.type === 'streamer-ready') {
         setStatus('connecting', 'Negotiating...');
         await createAndSendOffer();
       } else if (msg.type === 'answer') {
         try {
+          log('SDP answer codecs', parseSdpCodecs(msg.sdp));
           await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-        } catch { setStatus('error', 'Negotiation failed'); }
+          log('setRemoteDescription done');
+        } catch(e) { log('setRemoteDescription failed', e.message); setStatus('error', 'Negotiation failed'); }
       } else if (msg.type === 'ice-candidate') {
         if (!msg.candidate) return;
+        const isMdns = msg.candidate.includes('.local');
+        const typeMatch = msg.candidate.match(/typ (\w+)/);
+        log('ICE remote candidate', `type=${typeMatch?.[1] ?? '?'}`, isMdns ? '⚠️ mDNS' : '', msg.candidate.slice(0, 80));
         try {
           await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex, sdpMid: msg.sdpMid });
         } catch { /* ignore stale candidates */ }
       } else if (msg.type === 'streamer-disconnected') {
+        log('Streamer disconnected');
         setStatus('error', 'Streamer disconnected');
         video.srcObject = null;
       }
     };
 
-    ws.onerror = () => setStatus('error', 'Signaling unreachable');
-    ws.onclose = () => setStatus('error', 'WS closed');
+    ws.onerror = (e) => { log('WS error', e); setStatus('error', 'Signaling unreachable'); };
+    ws.onclose = (e) => { log('WS closed', `code=${e.code}`); setStatus('error', 'WS closed'); };
 
     async function createAndSendOffer() {
       try {
@@ -420,9 +605,12 @@
           pc.addTransceiver('video', { direction: 'recvonly' });
         }
         const offer = await pc.createOffer();
+        log('SDP offer codecs', parseSdpCodecs(offer.sdp));
         await pc.setLocalDescription(offer);
+        log('offer sent');
         ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
-      } catch {
+      } catch(e) {
+        log('createOffer failed', e.message);
         setStatus('error', 'Offer failed');
       }
     }
