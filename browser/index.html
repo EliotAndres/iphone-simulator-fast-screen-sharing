@@ -88,28 +88,6 @@
     }
     .menu-item:hover { background: rgba(255,255,255,0.1); }
     .menu-item svg { width: 16px; height: 16px; fill: #fff; opacity: 0.7; flex-shrink: 0; }
-    #stats-overlay {
-      position: fixed;
-      bottom: 16px; right: 16px;
-      background: rgba(0,0,0,0.7);
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 10px;
-      padding: 8px 12px;
-      font-size: 12px;
-      font-family: 'SF Mono', 'Menlo', monospace;
-      line-height: 1.6;
-      z-index: 10;
-      backdrop-filter: blur(8px);
-      color: rgba(255,255,255,0.85);
-      display: none;
-    }
-    #stats-overlay.visible { display: block; }
-    #stats-overlay .stat-row { display: flex; justify-content: space-between; gap: 16px; }
-    #stats-overlay .stat-label { color: rgba(255,255,255,0.45); }
-    #stats-overlay .stat-value { text-align: right; }
-    #stats-overlay .lag-ok   { color: #30d158; }
-    #stats-overlay .lag-warn { color: #f0a500; }
-    #stats-overlay .lag-bad  { color: #ff453a; }
   </style>
 </head>
 <body>
@@ -135,25 +113,13 @@
 
   <video id="video" autoplay playsinline muted></video>
 
-  <div id="stats-overlay">
-    <div class="stat-row"><span class="stat-label">wall lag</span><span class="stat-value" id="stat-wall">—</span></div>
-    <div class="stat-row"><span class="stat-label">buffered lag</span><span class="stat-value" id="stat-buf">—</span></div>
-    <div class="stat-row"><span class="stat-label">seeks</span><span class="stat-value" id="stat-seeks">0</span></div>
-    <div class="stat-row"><span class="stat-label">hidden lag</span><span class="stat-value" id="stat-hidden">0</span></div>
-  </div>
-
   <script>
     const video = document.getElementById('video');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
     const settingsBtn = document.getElementById('settings-btn');
     const settingsMenu = document.getElementById('settings-menu');
-    const statsOverlay = document.getElementById('stats-overlay');
-    const statWall = document.getElementById('stat-wall');
-    const statBuf = document.getElementById('stat-buf');
-    const statSeeks = document.getElementById('stat-seeks');
-    const statHidden = document.getElementById('stat-hidden');
-    let seekCount = 0, hiddenCount = 0;
+    let hiddenCount = 0;
 
     // ─── Timing helpers ───────────────────────────────────────────────────────
     const T0 = performance.now();
@@ -182,18 +148,6 @@
       });
       if (codecs.length === 0) Object.values(payloadMap).forEach(v => codecs.push(v));
       return codecs;
-    }
-
-    function lagClass(s) {
-      return s < 0.1 ? 'lag-ok' : s < 0.5 ? 'lag-warn' : 'lag-bad';
-    }
-    function updateStats(wallLag, bufferedLag) {
-      statWall.textContent = (wallLag * 1000).toFixed(0) + ' ms';
-      statWall.className = 'stat-value ' + lagClass(wallLag);
-      statBuf.textContent = (bufferedLag * 1000).toFixed(0) + ' ms';
-      statBuf.className = 'stat-value ' + lagClass(bufferedLag);
-      statSeeks.textContent = seekCount;
-      statHidden.textContent = hiddenCount;
     }
 
     function setStatus(state, text) {
@@ -424,8 +378,6 @@
       if (bufferedLag > 0.05) {
         log('seekToLiveEdge', reason, `lag=${(bufferedLag*1000).toFixed(0)}ms → seeking to ${liveEdge.toFixed(3)}s`);
         video.currentTime = liveEdge;
-        seekCount++;
-        statSeeks.textContent = seekCount;
       }
       // Re-anchor wall-clock reference after seek
       refWallTime = performance.now();
@@ -467,7 +419,6 @@
         const bufferedLag = video.buffered.length > 0
           ? video.buffered.end(video.buffered.length - 1) - video.currentTime
           : 0;
-        updateStats(wallLag, bufferedLag);
         if (wallLag > 0.3) {
           if (bufferedLag > 0.05) {
             // Lag is visible to JS — seek directly
@@ -478,7 +429,6 @@
             if (hiddenCount % 30 === 0)
               log('hidden lag (AVFoundation?)', `wall=${wallLag.toFixed(2)}s buffered=${bufferedLag.toFixed(2)}s`);
             hiddenCount++;
-            statHidden.textContent = hiddenCount;
             refWallTime = performance.now();
             refVideoTime = video.currentTime;
           }
@@ -488,14 +438,12 @@
     }
     function stopLiveEdgePursuit() {
       if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
-      statsOverlay.classList.remove('visible');
       if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     }
 
     video.addEventListener('playing', () => {
       setStatus('streaming', 'Streaming');
-      statsOverlay.classList.add('visible');
-      seekCount = 0; hiddenCount = 0;
+      hiddenCount = 0;
       const bufferedAtPlay = video.buffered.length > 0
         ? video.buffered.end(video.buffered.length - 1).toFixed(3)
         : 'none';
