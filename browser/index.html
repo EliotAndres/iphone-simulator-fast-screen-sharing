@@ -220,8 +220,33 @@
       sendTouch('up', t.clientX, t.clientY);
     });
 
-    video.onplaying = () => setStatus('streaming', 'Streaming');
-    video.onerror   = () => setStatus('error', 'Video error');
+    video.onerror = () => setStatus('error', 'Video error');
+
+    // Safari's AVFoundation pipeline buffers ahead independently of the WebRTC
+    // jitter buffer, causing 2-3s of lag. Use requestVideoFrameCallback to detect
+    // drift and seek currentTime to the live edge.
+    let liveEdgePursuit = null;
+    function startLiveEdgePursuit() {
+      if (liveEdgePursuit) return;
+      function step() {
+        liveEdgePursuit = video.requestVideoFrameCallback(step);
+        if (video.buffered.length === 0) return;
+        const liveEdge = video.buffered.end(video.buffered.length - 1);
+        const lag = liveEdge - video.currentTime;
+        if (lag > 0.15) {
+          console.log(`[Video] Lag ${lag.toFixed(3)}s — seeking to live edge`);
+          video.currentTime = liveEdge;
+        }
+      }
+      liveEdgePursuit = video.requestVideoFrameCallback(step);
+    }
+    function stopLiveEdgePursuit() {
+      if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
+    }
+
+    video.addEventListener('playing', () => { setStatus('streaming', 'Streaming'); startLiveEdgePursuit(); });
+    video.addEventListener('pause',   stopLiveEdgePursuit);
+    video.addEventListener('ended',   stopLiveEdgePursuit);
 
     pc.ontrack = (event) => {
       // Minimize jitter buffer delay (Safari 16+, Chrome 107+).
