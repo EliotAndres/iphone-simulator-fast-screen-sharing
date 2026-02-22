@@ -119,8 +119,6 @@
     const statusText = document.getElementById('status-text');
     const settingsBtn = document.getElementById('settings-btn');
     const settingsMenu = document.getElementById('settings-menu');
-    let hiddenCount = 0;
-
     // ─── Timing helpers ───────────────────────────────────────────────────────
     const T0 = performance.now();
     function ts() { return ((performance.now() - T0) / 1000).toFixed(3) + 's'; }
@@ -359,116 +357,16 @@
     );
     video.onerror = (e) => { log('video:error', video.error); setStatus('error', 'Video error'); };
 
-    // Safari problem: during ICE negotiation (slower through a tunnel due to mDNS
-    // candidate resolution), frames pile up in the receive buffer before playback
-    // starts, resulting in 2-3s of lag from frame 1. AVFoundation also adds its own
-    // buffer on top of the WebRTC jitter buffer.
-    //
-    // Fix: seek to the live edge immediately on 'playing', then use wall-clock drift
-    // detection + seeking to keep up. playbackRate is spec-prohibited for live
-    // MediaStream and silently ignored by Safari, so we never use it.
-    let liveEdgePursuit = null;
-    let refWallTime = null;
-    let refVideoTime = null;
-
-    function seekToLiveEdge(reason) {
-      if (video.buffered.length === 0) { log('seekToLiveEdge: no buffered data', reason); return; }
-      const liveEdge = video.buffered.end(video.buffered.length - 1);
-      const bufferedLag = liveEdge - video.currentTime;
-      if (bufferedLag > 0.05) {
-        log('seekToLiveEdge', reason, `lag=${(bufferedLag*1000).toFixed(0)}ms → seeking to ${liveEdge.toFixed(3)}s`);
-        video.currentTime = liveEdge;
-      }
-      // Re-anchor wall-clock reference after seek
-      refWallTime = performance.now();
-      refVideoTime = video.currentTime;
-    }
-
-    let firstFrameLogged = false;
-    function startLiveEdgePursuit() {
-      if (liveEdgePursuit) return;
-      refWallTime = null;
-      refVideoTime = null;
-      firstFrameLogged = false;
-      function step(now, metadata) {
-        liveEdgePursuit = video.requestVideoFrameCallback(step);
-
-        // Log first frame metadata — key for comparing Safari vs Firefox
-        if (!firstFrameLogged && metadata) {
-          firstFrameLogged = true;
-          log('FRAME first frame metadata',
-            `presentationTime=${metadata.presentationTime?.toFixed(3) ?? '?'}`,
-            `expectedDisplayTime=${metadata.expectedDisplayTime?.toFixed(3) ?? '?'}`,
-            `mediaTime=${metadata.mediaTime?.toFixed(3) ?? '?'}`,
-            `captureTime=${metadata.captureTime?.toFixed(3) ?? '?'}`,
-            `receiveTime=${metadata.receiveTime?.toFixed(3) ?? '?'}`,
-            `width=${metadata.width}x${metadata.height}`
-          );
-          log('FRAME first frame video.currentTime', video.currentTime.toFixed(3),
-            `buffered=${video.buffered.length > 0 ? video.buffered.end(video.buffered.length-1).toFixed(3) : 'none'}`
-          );
-        }
-
-        if (refWallTime === null) {
-          refWallTime = performance.now();
-          refVideoTime = video.currentTime;
-          return;
-        }
-        const expectedVideoTime = refVideoTime + (performance.now() - refWallTime) / 1000;
-        const wallLag = expectedVideoTime - video.currentTime;
-        const bufferedLag = video.buffered.length > 0
-          ? video.buffered.end(video.buffered.length - 1) - video.currentTime
-          : 0;
-        if (wallLag > 0.3) {
-          if (bufferedLag > 0.05) {
-            // Lag is visible to JS — seek directly
-            seekToLiveEdge(`wall lag ${wallLag.toFixed(2)}s`);
-          } else {
-            // Wall-clock says we're behind but video.buffered doesn't see it:
-            // AVFoundation internal buffer. Re-anchor so we don't spam seeks.
-            if (hiddenCount % 30 === 0)
-              log('hidden lag (AVFoundation?)', `wall=${wallLag.toFixed(2)}s buffered=${bufferedLag.toFixed(2)}s`);
-            hiddenCount++;
-            refWallTime = performance.now();
-            refVideoTime = video.currentTime;
-          }
-        }
-      }
-      liveEdgePursuit = video.requestVideoFrameCallback(step);
-    }
-    function stopLiveEdgePursuit() {
-      if (liveEdgePursuit) { video.cancelVideoFrameCallback(liveEdgePursuit); liveEdgePursuit = null; }
-      if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-    }
-
     video.addEventListener('playing', () => {
       setStatus('streaming', 'Streaming');
-      hiddenCount = 0;
       const bufferedAtPlay = video.buffered.length > 0
         ? video.buffered.end(video.buffered.length - 1).toFixed(3)
         : 'none';
       log('video:playing', `currentTime=${video.currentTime.toFixed(3)}`, `buffered end=${bufferedAtPlay}s`);
-      // Drain any frames that accumulated during ICE negotiation before seeking
-      // back to live.  A short delay lets Safari populate video.buffered first.
-      setTimeout(() => seekToLiveEdge('initial play'), 200);
-      startLiveEdgePursuit();
     });
-    video.addEventListener('pause',   stopLiveEdgePursuit);
-    video.addEventListener('ended',   stopLiveEdgePursuit);
 
     pc.ontrack = (event) => {
-      log('ontrack', `kind=${event.track.kind}`, `id=${event.track.id}`,
-        `streams=${event.streams.length}`,
-        `jitterBufferTarget supported=${event.receiver?.jitterBufferTarget !== undefined}`
-      );
-
-      // Minimize jitter buffer delay (Safari 16+, Chrome 107+).
-      if (event.receiver?.jitterBufferTarget !== undefined) {
-        event.receiver.jitterBufferTarget = 0;
-        log('ontrack jitterBufferTarget set to 0');
-      } else {
-        log('ontrack jitterBufferTarget NOT supported in this browser');
-      }
+      log('ontrack', `kind=${event.track.kind}`, `id=${event.track.id}`, `streams=${event.streams.length}`);
 
       // Log receiver capabilities
       if (event.receiver?.getParameters) {
