@@ -179,13 +179,15 @@
 
     let pendingMove = null;
     let moveRafPending = false;
+    let gestureActive = false;
+
     function queueMove(clientX, clientY) {
       pendingMove = { clientX, clientY };
       if (!moveRafPending) {
         moveRafPending = true;
         requestAnimationFrame(() => {
           moveRafPending = false;
-          if (pendingMove) {
+          if (pendingMove && gestureActive) {
             sendTouch('move', pendingMove.clientX, pendingMove.clientY);
             pendingMove = null;
           }
@@ -193,24 +195,54 @@
       }
     }
 
-    canvas.addEventListener('mousedown', (e) => { e.preventDefault(); sendTouch('down', e.clientX, e.clientY); });
-    canvas.addEventListener('mousemove', (e) => { if (e.buttons & 1) queueMove(e.clientX, e.clientY); });
-    canvas.addEventListener('mouseup',   (e) => { sendTouch('up', e.clientX, e.clientY); });
+    function flushPendingMove() {
+      if (pendingMove) {
+        sendTouch('move', pendingMove.clientX, pendingMove.clientY);
+        pendingMove = null;
+      }
+    }
+
+    function startGesture(clientX, clientY) {
+      gestureActive = true;
+      sendTouch('down', clientX, clientY);
+    }
+
+    // Flush any buffered move synchronously so it can't arrive AFTER 'up'
+    // (which would leave the simulator thinking a drag is still in progress).
+    function endGesture(clientX, clientY) {
+      if (!gestureActive) return;
+      gestureActive = false;
+      flushPendingMove();
+      sendTouch('up', clientX, clientY);
+    }
+
+    canvas.addEventListener('mousedown', (e) => { e.preventDefault(); startGesture(e.clientX, e.clientY); });
+    canvas.addEventListener('mousemove', (e) => { if (gestureActive) queueMove(e.clientX, e.clientY); });
+    // mouseup on window so a drag released outside the canvas still ends cleanly.
+    window.addEventListener('mouseup', (e) => { endGesture(e.clientX, e.clientY); });
 
     canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
       const t = e.touches[0];
-      sendTouch('down', t.clientX, t.clientY);
+      startGesture(t.clientX, t.clientY);
     });
     canvas.addEventListener('touchmove', (e) => {
       e.preventDefault();
+      if (!gestureActive) return;
       const t = e.touches[0];
       queueMove(t.clientX, t.clientY);
     });
     canvas.addEventListener('touchend', (e) => {
       e.preventDefault();
       const t = e.changedTouches[0];
-      sendTouch('up', t.clientX, t.clientY);
+      endGesture(t.clientX, t.clientY);
+    });
+    // Safari fires touchcancel (not touchend) when the system reclaims the
+    // gesture — scroll hijack, multi-touch, system UI, notification. Without
+    // this, the simulator would think a finger is still on the screen.
+    canvas.addEventListener('touchcancel', (e) => {
+      const t = e.changedTouches[0];
+      endGesture(t?.clientX ?? 0, t?.clientY ?? 0);
     });
 
     // ─── WebCodecs decoder ────────────────────────────────────────────────────
