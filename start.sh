@@ -42,6 +42,9 @@ if [[ $tunnel -eq 1 ]] && ! command -v cloudflared >/dev/null 2>&1; then
 fi
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
+# Optional: SIMULATOR_STREAM_PREFER_SOFTWARE_ENCODER=1 — prefer software H.264 in VMs where HW VT fails.
+# Inherited by `swift run` (see README).
+
 pids=()
 cleanup() {
   echo

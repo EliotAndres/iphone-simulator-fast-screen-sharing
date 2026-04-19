@@ -19,8 +19,16 @@ final class H264Encoder {
     private var forceNextKeyframe = false
     private var announcedCodec = false
     private var outputErrorCount = 0
+    /// After repeated encode callback failures (typical in macOS VMs: HW session creates but never emits frames).
+    private var softwareEncoderForced = false
     private let bitrate: Int
     private let fps: Int
+
+    /// Prefer software H.264 from the first frame (set env SIMULATOR_STREAM_PREFER_SOFTWARE_ENCODER=1 in VMs).
+    private static var preferSoftwareEncoderFromStart: Bool {
+        let v = ProcessInfo.processInfo.environment["SIMULATOR_STREAM_PREFER_SOFTWARE_ENCODER"] ?? ""
+        return v == "1" || v.lowercased() == "true" || v.lowercased() == "yes"
+    }
 
     init(bitrate: Int = 6_000_000, fps: Int = 60) {
         self.bitrate = bitrate
@@ -38,6 +46,9 @@ final class H264Encoder {
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
+        if w != width || h != height {
+            softwareEncoderForced = false
+        }
         if session == nil || w != width || h != height {
             configure(width: w, height: h)
         }
@@ -84,16 +95,26 @@ final class H264Encoder {
         Self.logVideoEncoderList(width: width, height: height)
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        // Prefer the HW low-latency rate controller (drops ~1 frame of buffering).
-        // It only exists on the Apple Silicon hardware encoder, so guests under
-        // Virtualization.framework that don't expose the Media Engine fail with
-        // -12915. Fall back to a default session and let VT pick a software encoder.
         let lowLatencySpec: [CFString: Any] = [
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue as Any
         ]
-        var sess = Self.createSession(width: width, height: height, spec: lowLatencySpec as CFDictionary, refcon: selfPtr, label: "low-latency HW")
-        if sess == nil {
-            sess = Self.createSession(width: width, height: height, spec: nil, refcon: selfPtr, label: "default (SW fallback OK)")
+        let softwarePreferSpec: [CFString: Any] = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanFalse as Any
+        ]
+
+        var sess: VTCompressionSession?
+        if Self.preferSoftwareEncoderFromStart || softwareEncoderForced {
+            let why = softwareEncoderForced ? "runtime SW fallback" : "SIMULATOR_STREAM_PREFER_SOFTWARE_ENCODER"
+            sess = Self.createSession(width: width, height: height, spec: softwarePreferSpec as CFDictionary, refcon: selfPtr, label: "prefer-SW (\(why))")
+            if sess == nil {
+                sess = Self.createSession(width: width, height: height, spec: nil, refcon: selfPtr, label: "default after prefer-SW fail")
+            }
+        } else {
+            // Bare metal: low-latency HW first; VM often creates a session then never emits (-12908/-12915) — outputCallback forces softwareEncoderForced.
+            sess = Self.createSession(width: width, height: height, spec: lowLatencySpec as CFDictionary, refcon: selfPtr, label: "low-latency HW")
+            if sess == nil {
+                sess = Self.createSession(width: width, height: height, spec: nil, refcon: selfPtr, label: "default (create fallback)")
+            }
         }
         guard let sess = sess else { return }
 
@@ -119,10 +140,18 @@ final class H264Encoder {
             print("[Encoder] VTCompressionSessionPrepareToEncodeFrames status=\(prep) (\(Self.vtStatusLabel(prep)))")
         }
 
+        // Use withUnsafeMutablePointer so valueOut is typed as CFTypeRef?, not bridged via a raw Optional<AnyObject> warning.
         var hwProp: CFTypeRef?
-        let hwSt = VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: kCFAllocatorDefault, valueOut: &hwProp)
-        if hwSt == noErr, let hwProp = hwProp {
-            print("[Encoder] UsingHardwareAcceleratedVideoEncoder (after prepare)=\(hwProp)")
+        let hwSt = withUnsafeMutablePointer(to: &hwProp) { valueOut in
+            VTSessionCopyProperty(
+                sess,
+                key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                allocator: kCFAllocatorDefault,
+                valueOut: valueOut
+            )
+        }
+        if hwSt == noErr, let v = hwProp {
+            print("[Encoder] UsingHardwareAcceleratedVideoEncoder (after prepare)=\(v)")
         } else {
             print("[Encoder] UsingHardwareAcceleratedVideoEncoder query status=\(hwSt) (\(Self.vtStatusLabel(hwSt))) value=\(String(describing: hwProp))")
         }
@@ -209,8 +238,17 @@ final class H264Encoder {
             if n <= 5 || n % 120 == 0 {
                 print("[Encoder] Output callback status=\(status) (\(label)) infoFlags=\(infoFlags) sampleBuffer=\(hasBuf) (count=\(n))")
             }
+            // HW session on Apple VM often creates OK but never delivers frames; switch to software encoder.
+            if !encoder.softwareEncoderForced, !H264Encoder.preferSoftwareEncoderFromStart,
+               (status == kVTCouldNotFindVideoEncoderErr || status == kVTVideoEncoderNotAvailableNowErr),
+               n >= 3 {
+                encoder.softwareEncoderForced = true
+                print("[Encoder] Switching to software H.264 encoder after \(n) failed output callbacks (invalidate HW session)")
+                encoder.invalidate()
+            }
             return
         }
+        encoder.outputErrorCount = 0
         encoder.handleEncoded(sampleBuffer)
     }
 
