@@ -1,27 +1,31 @@
 import Foundation
-import WebRTC
 
 final class StreamingApp {
     private let captureManager = CaptureManager()
-    private let webRTCManager = WebRTCManager()
-    private let signalingClient: SignalingClient
+    private let streamManager = StreamManager()
+    private let socket: StreamSocket
     private let touchInjector = TouchInjector()
 
     init() {
-        signalingClient = SignalingClient(url: URL(string: "ws://localhost:3000/ws")!)
+        let defaultURL = URL(string: "ws://localhost:3000/ws")!
+        let url = ProcessInfo.processInfo.environment["SIMULATOR_SIGNALING_URL"]
+            .flatMap { URL(string: $0) } ?? defaultURL
+        socket = StreamSocket(url: url)
+        print("[App] Streaming WebSocket URL: \(url.absoluteString) (override with SIMULATOR_SIGNALING_URL)")
     }
 
     func start() {
-        setupSignalingHandlers()
-        signalingClient.connect()
+        wireHandlers()
+        socket.connect()
 
         Task {
             do {
                 try await captureManager.start()
                 touchInjector.setVideoIsCropped(captureManager.deviceScreenRect != nil)
                 captureManager.onFrame = { [weak self] pixelBuffer, timestamp in
-                    self?.webRTCManager.pushFrame(pixelBuffer, timestamp: timestamp)
+                    self?.streamManager.pushFrame(pixelBuffer, timestamp: timestamp)
                 }
+                touchInjector.resolveSimulator()
             } catch {
                 print("[App] Failed to start capture: \(error)")
                 print("[App] Hint: Grant Screen Recording permission to Terminal in System Settings → Privacy & Security → Screen Recording")
@@ -29,52 +33,35 @@ final class StreamingApp {
         }
     }
 
-    private func setupSignalingHandlers() {
-        signalingClient.onOffer = { [weak self] sdp in
-            guard let self = self else { return }
-            Task {
-                do {
-                    print("[App] Handling offer, creating answer...")
-                    let answerSdp = try await self.webRTCManager.handleOffer(sdp)
-                    self.signalingClient.sendAnswer(answerSdp)
-                    print("[App] Answer sent")
-                } catch {
-                    print("[App] Failed to handle offer: \(error)")
-                }
-            }
+    private func wireHandlers() {
+        streamManager.onSendJSON = { [weak self] json in
+            self?.socket.sendJSON(json)
+        }
+        streamManager.onSendBinaryFrame = { [weak self] isKey, pts, data in
+            self?.socket.sendBinaryFrame(isKey: isKey, ptsMicros: pts, annexB: data)
         }
 
-        signalingClient.onIceCandidate = { [weak self] candidate, sdpMLineIndex, sdpMid in
-            let iceCandidate = RTCIceCandidate(sdp: candidate, sdpMLineIndex: sdpMLineIndex, sdpMid: sdpMid)
-            self?.webRTCManager.addIceCandidate(iceCandidate)
+        socket.onViewerJoined = { [weak self] in
+            self?.streamManager.viewerJoined()
+            // Pump fresh frames in case the simulator content is static — SCStream
+            // only delivers on change, so without this a new viewer could hang.
+            self?.captureManager.startIdleFramePump()
         }
-
-        webRTCManager.onIceCandidate = { [weak self] candidate in
-            self?.signalingClient.sendIceCandidate(
-                candidate.sdp,
-                sdpMLineIndex: candidate.sdpMLineIndex,
-                sdpMid: candidate.sdpMid
-            )
+        socket.onViewerLeft = { [weak self] in
+            self?.streamManager.viewerLeft()
         }
-
-        webRTCManager.onTouchEvent = { [weak self] event in
+        socket.onRequestKeyframe = { [weak self] in
+            self?.streamManager.requestKeyframe()
+        }
+        socket.onTouchEvent = { [weak self] event in
             self?.touchInjector.handleTouch(event)
         }
-
-        webRTCManager.onCommand = { [weak self] command in
+        socket.onCommand = { [weak self] command in
             switch command {
             case "home":
                 self?.touchInjector.pressHome()
             default:
                 print("[App] Unknown command: \(command)")
-            }
-        }
-
-        webRTCManager.onConnectionStateChange = { [weak self] state in
-            print("[App] WebRTC connection state changed: \(state.rawValue)")
-            if state == .connected {
-                self?.captureManager.startIdleFramePump()
-                self?.touchInjector.resolveSimulator()
             }
         }
     }

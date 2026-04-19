@@ -13,89 +13,107 @@ const httpServer = http.createServer((req, res) => {
   });
 });
 
-// WebSocket server attached to HTTP server (same port for tunnel compatibility)
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+// WebSocket server attached to HTTP server (same port for tunnel compatibility).
+// perMessageDeflate: false avoids occasional framing issues behind reverse proxies
+// and, more importantly, would waste CPU on already-compressed H.264 payloads.
+const wss = new WebSocketServer({
+  server: httpServer,
+  path: '/ws',
+  perMessageDeflate: false,
+  maxPayload: 16 * 1024 * 1024,
+});
+
+// Cloudflare quick tunnels and similar proxies often close idle WebSockets; ping keeps them up.
+const WS_PING_MS = 20000;
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === 1) ws.ping();
+  });
+}, WS_PING_MS);
 
 httpServer.listen(3000, () => {
   console.log('[Server] HTTP server listening on http://localhost:3000');
-  console.log('[Signaling] WebSocket server on ws://localhost:3000/ws');
+  console.log('[Stream] WebSocket server on ws://localhost:3000/ws');
 });
 
 let streamer = null;
 let activeViewer = null; // only one viewer at a time
 
-function send(ws, obj) {
+function sendJSON(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-wss.on('connection', (ws) => {
-  ws.on('message', (data) => {
+function sendBinary(ws, buf) {
+  if (ws && ws.readyState === 1) ws.send(buf, { binary: true });
+}
+
+wss.on('connection', (ws, req) => {
+  const ip = req.socket?.remoteAddress ?? req.headers['x-forwarded-for'] ?? '?';
+  const ua = (req.headers['user-agent'] || '').slice(0, 100);
+  console.log('[Stream] WS client connected from', ip, 'path=', req.url, 'ua=', ua);
+
+  ws.on('message', (data, isBinary) => {
+    // Binary: H.264 frames from streamer → forward to active viewer as-is.
+    if (isBinary) {
+      if (ws === streamer) sendBinary(activeViewer, data);
+      return;
+    }
+
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === 'register') {
       if (msg.role === 'streamer') {
         streamer = ws;
-        console.log('[Signaling] Streamer registered');
-        // Notify any waiting active viewer
-        if (activeViewer) send(activeViewer, { type: 'streamer-ready' });
+        console.log('[Stream] Streamer registered');
+        if (activeViewer) {
+          sendJSON(streamer, { type: 'viewer-joined' });
+          sendJSON(activeViewer, { type: 'streamer-ready' });
+        }
       } else {
-        // Disconnect previous viewer if any
         if (activeViewer && activeViewer !== ws && activeViewer.readyState === 1) {
-          console.log('[Signaling] Replacing old viewer');
+          console.log('[Stream] Replacing old viewer');
           activeViewer.close();
         }
         activeViewer = ws;
-        console.log('[Signaling] Viewer registered');
+        console.log('[Stream] Viewer registered');
         if (streamer && streamer.readyState === 1) {
-          send(ws, { type: 'streamer-ready' });
+          sendJSON(streamer, { type: 'viewer-joined' });
+          sendJSON(ws, { type: 'streamer-ready' });
         } else {
-          console.log('[Signaling] No streamer yet, viewer waiting');
+          console.log('[Stream] No streamer yet, viewer waiting');
         }
       }
       return;
     }
 
-    // Offer from viewer → streamer
-    if (msg.type === 'offer') {
-      console.log('[Signaling] Routing offer to streamer');
-      send(streamer, msg);
+    // Streamer → viewer: video-init config
+    if (msg.type === 'video-init' && ws === streamer) {
+      sendJSON(activeViewer, msg);
       return;
     }
 
-    // Answer from streamer → active viewer only
-    if (msg.type === 'answer') {
-      console.log('[Signaling] Routing answer to viewer');
-      send(activeViewer, msg);
-      return;
-    }
-
-    // ICE: viewer → streamer
-    if (msg.type === 'ice-candidate' && ws === activeViewer) {
-      console.log('[Signaling] ICE viewer→streamer:', msg.candidate && msg.candidate.slice(0, 60));
-      send(streamer, msg);
-      return;
-    }
-
-    // ICE: streamer → active viewer
-    if (msg.type === 'ice-candidate' && ws === streamer) {
-      console.log('[Signaling] ICE streamer→viewer:', msg.candidate && msg.candidate.slice(0, 60));
-      send(activeViewer, msg);
-      return;
+    // Viewer → streamer: touch events, commands, and keyframe requests
+    if (ws === activeViewer) {
+      if (msg.type === 'down' || msg.type === 'move' || msg.type === 'up' ||
+          msg.type === 'home' || msg.type === 'request-keyframe') {
+        sendJSON(streamer, msg);
+        return;
+      }
     }
   });
 
   ws.on('close', () => {
     if (ws === streamer) {
       streamer = null;
-      console.log('[Signaling] Streamer disconnected');
-      if (activeViewer) send(activeViewer, { type: 'streamer-disconnected' });
+      console.log('[Stream] Streamer disconnected');
+      if (activeViewer) sendJSON(activeViewer, { type: 'streamer-disconnected' });
     } else if (ws === activeViewer) {
       activeViewer = null;
-      console.log('[Signaling] Viewer disconnected');
+      console.log('[Stream] Viewer disconnected');
+      if (streamer) sendJSON(streamer, { type: 'viewer-left' });
     }
   });
 
-  ws.on('error', (err) => console.error('[Signaling] Error:', err.message));
+  ws.on('error', (err) => console.error('[Stream] Error:', err.message));
 });
-

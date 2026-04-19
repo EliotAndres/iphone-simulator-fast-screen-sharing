@@ -14,6 +14,10 @@ final class CaptureManager: NSObject {
     private var lastPixelBuffer: CVPixelBuffer?
     private var idleTimer: DispatchSourceTimer?
     private var hasReceivedRealFrame = false
+    /// First N SCStream frames get extra logging (dimensions / format / pts).
+    private var debugFrameLogRemaining = 5
+    /// One-shot JPEG on disk when `SIMULATOR_STREAM_DEBUG_JPEG=1`.
+    private var savedDebugJPEG = false
 
     private(set) var deviceScreenRect: CGRect?
 
@@ -119,7 +123,7 @@ final class CaptureManager: NSObject {
 
     private func makeConfiguration(windowSize: CGSize?) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = false
 
@@ -220,12 +224,39 @@ extension CaptureManager: SCStreamOutput {
         let timestamp = sampleBuffer.presentationTimeStamp
 
         if let pixelBuffer = sampleBuffer.imageBuffer {
+            if debugFrameLogRemaining > 0 {
+                debugFrameLogRemaining -= 1
+                let idx = 5 - debugFrameLogRemaining
+                CaptureDebug.logPixelBuffer(pixelBuffer, label: "SCStream frame #\(idx)", pts: timestamp)
+            }
+
+            maybeSaveDebugJPEG(pixelBuffer: pixelBuffer)
+
             lastPixelBuffer = pixelBuffer
             if !hasReceivedRealFrame {
                 hasReceivedRealFrame = true
                 stopIdleFramePump()
             }
             onFrame?(pixelBuffer, timestamp)
+        }
+    }
+
+    /// Set `SIMULATOR_STREAM_DEBUG_JPEG=1` to write the first frame to disk as JPEG (default path below).
+    /// Copy to your Mac, e.g. `scp admin@<tart-ip>:/tmp/simulator-stream-capture-debug.jpg .`
+    private func maybeSaveDebugJPEG(pixelBuffer: CVPixelBuffer) {
+        guard !savedDebugJPEG else { return }
+        guard ProcessInfo.processInfo.environment["SIMULATOR_STREAM_DEBUG_JPEG"] == "1" else { return }
+
+        let path = ProcessInfo.processInfo.environment["SIMULATOR_STREAM_DEBUG_JPEG_PATH"]
+            ?? "/tmp/simulator-stream-capture-debug.jpg"
+        savedDebugJPEG = true
+        do {
+            try CaptureDebug.saveJPEG(from: pixelBuffer, to: path)
+            let w = CVPixelBufferGetWidth(pixelBuffer)
+            let h = CVPixelBufferGetHeight(pixelBuffer)
+            print("[Capture] DEBUG JPEG saved (\(w)×\(h)) → \(path)")
+        } catch {
+            print("[Capture] DEBUG JPEG save failed: \(error)")
         }
     }
 }
