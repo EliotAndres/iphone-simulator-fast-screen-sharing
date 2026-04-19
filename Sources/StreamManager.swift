@@ -110,6 +110,16 @@ final class StreamManager {
         encoder.requestKeyframe()
     }
 
+    /// Live-update encoder bitrate (bits per second).
+    func setBitrate(_ bps: Int) {
+        encoder.setBitrate(bps)
+    }
+
+    /// Live-update encoder frame-rate hint. Capture FPS is set separately via CaptureManager.
+    func setFPS(_ fps: Int) {
+        encoder.setExpectedFrameRate(fps)
+    }
+
     private func sendVideoInit() {
         guard let codec = lastCodec, lastWidth > 0, lastHeight > 0 else { return }
         onSendJSON?([

@@ -4,7 +4,7 @@ import CoreMedia
 import CoreVideo
 import AppKit
 
-final class CaptureManager: NSObject {
+final class CaptureManager: NSObject, @unchecked Sendable {
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
 
     private var stream: SCStream?
@@ -18,6 +18,14 @@ final class CaptureManager: NSObject {
     private var savedDebugJPEG = false
 
     private(set) var deviceScreenRect: CGRect?
+
+    /// Source dimensions in points (either the cropped content rect or the whole window).
+    /// Used by `updateConfig` to recompute output pixel size when maxHeight changes.
+    private var sourcePointsSize: CGSize?
+    private var hostScaleFactor: CGFloat = 2.0
+    private var currentFPS: Int = 60
+    /// 0 = uncapped (use host scale factor).
+    private var maxOutputHeight: Int = 0
 
     func start() async throws {
         let content: SCShareableContent
@@ -103,27 +111,73 @@ final class CaptureManager: NSObject {
 
     private func makeConfiguration(windowSize: CGSize?) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(currentFPS))
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = false
 
         if let size = windowSize {
-            let scaleFactor = NSScreen.main?.backingScaleFactor ?? 2.0
+            hostScaleFactor = NSScreen.main?.backingScaleFactor ?? 2.0
 
             if let contentRect = detectSimulatorContentRect() {
                 self.deviceScreenRect = contentRect
                 config.sourceRect = contentRect
-                config.width = Int(contentRect.width * scaleFactor)
-                config.height = Int(contentRect.height * scaleFactor)
-                print("[Capture] Cropping to content area: \(contentRect) → \(config.width)x\(config.height)")
+                sourcePointsSize = contentRect.size
+                print("[Capture] Cropping to content area: \(contentRect)")
             } else {
-                config.width = Int(size.width * scaleFactor)
-                config.height = Int(size.height * scaleFactor)
-                print("[Capture] Output size: \(config.width)x\(config.height) (scale \(scaleFactor))")
+                sourcePointsSize = size
             }
+            applyOutputSize(to: config)
         }
 
         return config
+    }
+
+    /// Compute output pixel dimensions from stored source points + scale/cap.
+    private func applyOutputSize(to config: SCStreamConfiguration) {
+        guard let srcPoints = sourcePointsSize, srcPoints.height > 0 else { return }
+        let scale: CGFloat
+        if maxOutputHeight > 0 {
+            scale = min(hostScaleFactor, CGFloat(maxOutputHeight) / srcPoints.height)
+        } else {
+            scale = hostScaleFactor
+        }
+        config.width = Int(srcPoints.width * scale)
+        config.height = Int(srcPoints.height * scale)
+        print("[Capture] Output size: \(config.width)x\(config.height) (scale \(scale), cap \(maxOutputHeight))")
+    }
+
+    /// Live-tune frame rate and/or max output height. Safe to call while streaming.
+    /// `fps` clamps to 1…60. `maxHeight` of 0 removes the cap.
+    func updateConfig(fps: Int?, maxHeight: Int?) async {
+        guard let config = streamConfig, let stream = stream else { return }
+        let dimsChanged: Bool
+        if let fps = fps {
+            currentFPS = max(1, min(60, fps))
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(currentFPS))
+        }
+        if let maxHeight = maxHeight {
+            let prevW = config.width, prevH = config.height
+            maxOutputHeight = max(0, maxHeight)
+            applyOutputSize(to: config)
+            dimsChanged = (config.width != prevW || config.height != prevH)
+        } else {
+            dimsChanged = false
+        }
+        do {
+            try await stream.updateConfiguration(config)
+        } catch {
+            print("[Capture] updateConfiguration failed: \(error)")
+            return
+        }
+        // SCStream only delivers on content change — on a static screen there'd be
+        // no frame at the new dims. Drop the cached buffer (it's at the old dims)
+        // and kick a fresh screenshot so the viewer sees something immediately.
+        if dimsChanged {
+            streamQueue.async {
+                self.lastPixelBuffer = nil
+                self.pushOneFrame()
+            }
+        }
     }
 
     /// Uses macOS Accessibility to find the device screen content area inside

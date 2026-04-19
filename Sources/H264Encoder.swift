@@ -23,8 +23,8 @@ final class H264Encoder {
     private var softwareEncoderForced = false
     /// Set from VT output callback; session teardown must run on the `encode` thread to avoid racing `VTCompressionSessionEncodeFrame` (kVTInvalidSessionErr).
     private var fallbackRebuildNeeded = false
-    private let bitrate: Int
-    private let fps: Int
+    private var bitrate: Int
+    private var fps: Int
 
     /// Prefer software H.264 from the first frame (set env SIMULATOR_STREAM_PREFER_SOFTWARE_ENCODER=1 in VMs).
     private static var preferSoftwareEncoderFromStart: Bool {
@@ -45,11 +45,32 @@ final class H264Encoder {
         forceNextKeyframe = true
     }
 
+    /// Live-update bitrate on the running session; also stored for future sessions.
+    func setBitrate(_ bps: Int) {
+        bitrate = bps
+        guard let session = session else { return }
+        let s = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bps) as CFNumber)
+        if s != noErr {
+            print("[Encoder] setBitrate(\(bps)) failed status=\(s) (\(Self.vtStatusLabel(s)))")
+        } else {
+            print("[Encoder] bitrate → \(bps) bps")
+        }
+    }
+
+    /// Live-update expected framerate hint; also stored for future sessions.
+    func setExpectedFrameRate(_ fps: Int) {
+        self.fps = fps
+        guard let session = session else { return }
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: fps) as CFNumber)
+        print("[Encoder] expected fps → \(fps)")
+    }
+
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
         if w != width || h != height {
-            softwareEncoderForced = false
+            // Preserve softwareEncoderForced across dim changes — if HW never delivered
+            // at one size, it won't suddenly start at another (VM case).
             fallbackRebuildNeeded = false
         }
         if fallbackRebuildNeeded {

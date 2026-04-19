@@ -120,8 +120,33 @@ final class StreamingApp {
             touchInjector.handleTouch(TouchEvent(type: type, x: x, y: y))
         case "home":
             touchInjector.pressHome()
+        case "config":
+            handleConfig(json)
         default:
             print("[App] Unknown message type: \(type)")
+        }
+    }
+
+    /// Live quality sliders from the viewer. All fields optional.
+    /// fps (1–60), bitrate (bps), maxHeight (output pixels; 0 = uncapped).
+    /// fps + maxHeight are bundled into a single `SCStream.updateConfiguration`
+    /// call because concurrent reconfigs can leave SCStream not delivering (VM).
+    private func handleConfig(_ json: [String: Any]) {
+        if let bps = (json["bitrate"] as? NSNumber)?.intValue {
+            streamManager.setBitrate(max(100_000, min(20_000_000, bps)))
+        }
+        var fpsClamped: Int? = nil
+        if let fps = (json["fps"] as? NSNumber)?.intValue {
+            let c = max(1, min(60, fps))
+            fpsClamped = c
+            streamManager.setFPS(c)
+        }
+        var maxHeightClamped: Int? = nil
+        if let maxHeight = (json["maxHeight"] as? NSNumber)?.intValue {
+            maxHeightClamped = max(0, min(4000, maxHeight))
+        }
+        if fpsClamped != nil || maxHeightClamped != nil {
+            Task { await captureManager.updateConfig(fps: fpsClamped, maxHeight: maxHeightClamped) }
         }
     }
 }
