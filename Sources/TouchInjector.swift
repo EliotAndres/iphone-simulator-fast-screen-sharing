@@ -22,9 +22,7 @@ final class TouchInjector {
     private var contentHeightMacOS: Double = 0
 
 
-    init() {
-        resolveSimulator()
-    }
+    init() {}
 
     func pressHome() {
         queue.async { [weak self] in
@@ -73,6 +71,12 @@ final class TouchInjector {
         queue.async { [weak self] in
             guard let self else { return }
 
+            if self.screenWidth > 0, self.screenHeight > 0,
+               let proc = self.bridgeProcess, proc.isRunning {
+                print("[Touch] Skipping resolve — touch pipeline already ready")
+                return
+            }
+
             print("[Touch] Resolving simulator...")
             guard let udid = self.findBootedUDID() else {
                 print("[Touch] No booted simulator found")
@@ -81,12 +85,12 @@ final class TouchInjector {
             self.simulatorUDID = udid
             print("[Touch] Using simulator UDID: \(udid)")
 
-            if let size = self.queryScreenSize(udid: udid) {
+            if let size = self.queryScreenSizeWithRetries(udid: udid) {
                 self.screenWidth = size.width
                 self.screenHeight = size.height
                 print("[Touch] Screen size: \(size.width)x\(size.height) points")
             } else {
-                print("[Touch] Failed to query screen size")
+                print("[Touch] Failed to query screen size after retries (idb describe-all never reported a non-zero frame)")
                 return
             }
 
@@ -112,6 +116,11 @@ final class TouchInjector {
     // MARK: - Bridge process
 
     private func startBridge(socketPath: String) {
+        if let existing = bridgeProcess, existing.isRunning {
+            print("[Touch] HID bridge already running (pid \(existing.processIdentifier))")
+            return
+        }
+
         let scriptPath = self.bridgeScriptPath()
         guard FileManager.default.fileExists(atPath: scriptPath) else {
             print("[Touch] Bridge script not found at \(scriptPath)")
@@ -233,20 +242,44 @@ final class TouchInjector {
         return nil
     }
 
-    private func queryScreenSize(udid: String) -> CGSize? {
+    /// SpringBoard often reports 0×0 in `describe-all` briefly after boot; retry before giving up (VM/template races).
+    private func queryScreenSizeWithRetries(udid: String) -> CGSize? {
+        let maxAttempts = 30
+        let delaySeconds: TimeInterval = 1.5
+        for attempt in 1...maxAttempts {
+            let logDetail = attempt == 1 || attempt % 10 == 0
+            if let size = queryScreenSizeOnce(udid: udid, logFailures: logDetail), size.width > 0, size.height > 0 {
+                if attempt > 1 {
+                    print("[Touch] describe-all returned valid frame on attempt \(attempt)/\(maxAttempts)")
+                }
+                return size
+            }
+            if attempt < maxAttempts {
+                print("[Touch] describe-all not ready (attempt \(attempt)/\(maxAttempts)), retrying in \(delaySeconds)s…")
+                Thread.sleep(forTimeInterval: delaySeconds)
+            }
+        }
+        return nil
+    }
+
+    private func queryScreenSizeOnce(udid: String, logFailures: Bool = true) -> CGSize? {
         let output = shell("idb", "ui", "describe-all", "--udid", udid, "--json")
         guard let data = output.data(using: .utf8),
               let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let first = array.first,
               let frame = first["frame"] as? [String: Any] else {
-            let snippet = output.count > 400 ? String(output.prefix(400)) + "…" : output
-            print("[Touch] describe-all returned unparseable output:\n\(snippet)")
+            if logFailures {
+                let snippet = output.count > 400 ? String(output.prefix(400)) + "…" : output
+                print("[Touch] describe-all returned unparseable output:\n\(snippet)")
+            }
             return nil
         }
         let width = (frame["width"] as? Double) ?? Double(frame["width"] as? Int ?? 0)
         let height = (frame["height"] as? Double) ?? Double(frame["height"] as? Int ?? 0)
         guard width > 0, height > 0 else {
-            print("[Touch] describe-all returned frame without dimensions: \(frame)")
+            if logFailures {
+                print("[Touch] describe-all returned frame without dimensions: \(frame)")
+            }
             return nil
         }
         return CGSize(width: width, height: height)

@@ -84,6 +84,8 @@ final class StreamingApp {
 
             print("[App] Viewer connected")
             self.streamManager.viewerJoined()
+            // If the first resolve ran before SpringBoard had a layout, retry when someone actually uses the UI.
+            self.touchInjector.resolveSimulator()
             // Push one frame immediately so a static simulator screen doesn't
             // leave the viewer waiting for SCStream to deliver on content change.
             self.captureManager.pushCurrentFrame()
