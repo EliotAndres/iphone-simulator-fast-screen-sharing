@@ -332,8 +332,7 @@
 
     ws.onopen = () => {
       log('WS open');
-      ws.send(JSON.stringify({ type: 'register', role: 'viewer' }));
-      setStatus('connecting', 'Waiting for streamer...');
+      setStatus('connecting', 'Waiting for first frame...');
     };
 
     ws.onmessage = (event) => {
@@ -344,18 +343,10 @@
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
 
-      if (msg.type === 'streamer-ready') {
-        setStatus('connecting', 'Negotiating...');
-        // Streamer will now send us a video-init + keyframe.
-      } else if (msg.type === 'video-init') {
+      if (msg.type === 'video-init') {
         log('video-init', msg.codec, `${msg.width}x${msg.height}`);
         setStatus('connecting', 'Decoder ready');
         configureDecoder(msg.codec, msg.width, msg.height);
-      } else if (msg.type === 'streamer-disconnected') {
-        log('Streamer disconnected');
-        setStatus('error', 'Streamer disconnected');
-        if (decoder) { try { decoder.close(); } catch {} decoder = null; }
-        awaitingKeyframe = true;
       }
     };
 

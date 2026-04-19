@@ -3,20 +3,28 @@ import Foundation
 final class StreamingApp {
     private let captureManager = CaptureManager()
     private let streamManager = StreamManager()
-    private let socket: StreamSocket
     private let touchInjector = TouchInjector()
+    private let httpServer: HTTPServer
+
+    /// Single-viewer policy: if a second viewer connects, we close the first.
+    private var activeViewer: WebSocketConnection?
 
     init() {
-        let defaultURL = URL(string: "ws://localhost:3000/ws")!
-        let url = ProcessInfo.processInfo.environment["SIMULATOR_SIGNALING_URL"]
-            .flatMap { URL(string: $0) } ?? defaultURL
-        socket = StreamSocket(url: url)
-        print("[App] Streaming WebSocket URL: \(url.absoluteString) (override with SIMULATOR_SIGNALING_URL)")
+        let port = ProcessInfo.processInfo.environment["PORT"].flatMap { UInt16($0) } ?? 3738
+        httpServer = HTTPServer(port: port)
+        print("[App] Port: \(port) (override with PORT env var)")
     }
 
     func start() {
-        wireHandlers()
-        socket.connect()
+        wireStreamHandlers()
+        wireHTTPHandlers()
+
+        do {
+            try httpServer.start()
+        } catch {
+            print("[App] Failed to start HTTP server: \(error)")
+            return
+        }
 
         Task {
             do {
@@ -33,36 +41,79 @@ final class StreamingApp {
         }
     }
 
-    private func wireHandlers() {
+    // MARK: - Stream → WebSocket
+
+    private func wireStreamHandlers() {
         streamManager.onSendJSON = { [weak self] json in
-            self?.socket.sendJSON(json)
+            guard let viewer = self?.activeViewer else { return }
+            guard let data = try? JSONSerialization.data(withJSONObject: json),
+                  let text = String(data: data, encoding: .utf8) else { return }
+            viewer.sendText(text)
         }
-        streamManager.onSendBinaryFrame = { [weak self] isKey, pts, data in
-            self?.socket.sendBinaryFrame(isKey: isKey, ptsMicros: pts, annexB: data)
+        streamManager.onSendBinaryFrame = { [weak self] isKey, ptsMicros, annexB in
+            guard let viewer = self?.activeViewer else { return }
+            // [1 byte key flag][8 bytes pts µs BE][Annex-B]
+            var payload = Data(count: 9)
+            payload[0] = isKey ? 0x01 : 0x00
+            let pts = UInt64(bitPattern: ptsMicros).bigEndian
+            withUnsafeBytes(of: pts) { raw in
+                for i in 0..<8 { payload[1 + i] = raw[i] }
+            }
+            payload.append(annexB)
+            viewer.sendBinary(payload)
+        }
+    }
+
+    // MARK: - WebSocket → Stream
+
+    private func wireHTTPHandlers() {
+        httpServer.onViewerConnected = { [weak self] ws in
+            guard let self = self else { return }
+            if let old = self.activeViewer {
+                print("[App] Replacing old viewer")
+                old.close()
+            }
+            self.activeViewer = ws
+
+            ws.onText = { [weak self] text in
+                self?.handleJSON(text)
+            }
+            ws.onBinary = { data in
+                print("[App] Unexpected binary from viewer (\(data.count) bytes)")
+            }
+
+            print("[App] Viewer connected")
+            self.streamManager.viewerJoined()
+            self.captureManager.startIdleFramePump()
         }
 
-        socket.onViewerJoined = { [weak self] in
-            self?.streamManager.viewerJoined()
-            // Pump fresh frames in case the simulator content is static — SCStream
-            // only delivers on change, so without this a new viewer could hang.
-            self?.captureManager.startIdleFramePump()
-        }
-        socket.onViewerLeft = { [weak self] in
-            self?.streamManager.viewerLeft()
-        }
-        socket.onRequestKeyframe = { [weak self] in
-            self?.streamManager.requestKeyframe()
-        }
-        socket.onTouchEvent = { [weak self] event in
-            self?.touchInjector.handleTouch(event)
-        }
-        socket.onCommand = { [weak self] command in
-            switch command {
-            case "home":
-                self?.touchInjector.pressHome()
-            default:
-                print("[App] Unknown command: \(command)")
+        httpServer.onViewerDisconnected = { [weak self] ws in
+            guard let self = self else { return }
+            if self.activeViewer === ws {
+                print("[App] Viewer disconnected")
+                self.activeViewer = nil
+                self.streamManager.viewerLeft()
             }
+        }
+    }
+
+    private func handleJSON(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else {
+            return
+        }
+
+        switch type {
+        case "request-keyframe":
+            streamManager.requestKeyframe()
+        case "down", "move", "up":
+            guard let x = json["x"] as? Double, let y = json["y"] as? Double else { return }
+            touchInjector.handleTouch(TouchEvent(type: type, x: x, y: y))
+        case "home":
+            touchInjector.pressHome()
+        default:
+            print("[App] Unknown message type: \(type)")
         }
     }
 }

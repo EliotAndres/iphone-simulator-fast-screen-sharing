@@ -2,6 +2,12 @@ import Foundation
 import CoreMedia
 import CoreVideo
 
+struct TouchEvent: Codable {
+    let type: String   // "down", "move", "up"
+    let x: Double      // normalized 0..1
+    let y: Double      // normalized 0..1
+}
+
 /// Owns the H.264 encoder and the socket-facing side of the video pipeline.
 /// Replaces the previous libwebrtc-based WebRTCManager.
 final class StreamManager {
