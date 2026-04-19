@@ -12,9 +12,7 @@ while [[ $# -gt 0 ]]; do
 Usage: $0 [--tunnel]
 
 Starts the Swift streamer (which also serves the browser page and
-WebSocket on a single port). Ctrl-C stops it.
-
-Tries ports 3738..3742 in order and uses the first free one.
+WebSocket on port 3738). Ctrl-C stops it.
 
   --tunnel, -t   Also expose the running port via cloudflared.
 EOF
@@ -31,19 +29,12 @@ if [[ ! -x scripts/.venv/bin/python ]]; then
   exit 1
 fi
 
-PORT=""
-for p in 3738 3739 3740 3741 3742; do
-  if ! lsof -i :$p -P -n >/dev/null 2>&1; then
-    PORT=$p
-    break
-  fi
-done
-if [[ -z "$PORT" ]]; then
-  echo "[start] All candidate ports busy (3738-3742). Free one and retry:"
-  lsof -i :3738 -i :3739 -i :3740 -i :3741 -i :3742 -P -n | head
+PORT=3738
+if lsof -i :$PORT -P -n >/dev/null 2>&1; then
+  echo "[start] Port $PORT is busy. Free it first:"
+  lsof -i :$PORT -P -n
   exit 1
 fi
-echo "[start] Using port $PORT"
 
 if [[ $tunnel -eq 1 ]] && ! command -v cloudflared >/dev/null 2>&1; then
   echo "[start] cloudflared not found. Install with: brew install cloudflared"

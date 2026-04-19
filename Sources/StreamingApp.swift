@@ -84,7 +84,9 @@ final class StreamingApp {
 
             print("[App] Viewer connected")
             self.streamManager.viewerJoined()
-            self.captureManager.startIdleFramePump()
+            // Push one frame immediately so a static simulator screen doesn't
+            // leave the viewer waiting for SCStream to deliver on content change.
+            self.captureManager.pushCurrentFrame()
         }
 
         httpServer.onViewerDisconnected = { [weak self] ws in
@@ -107,6 +109,10 @@ final class StreamingApp {
         switch type {
         case "request-keyframe":
             streamManager.requestKeyframe()
+        case "pause":
+            streamManager.pause()
+        case "resume":
+            streamManager.resume()
         case "down", "move", "up":
             guard let x = json["x"] as? Double, let y = json["y"] as? Double else { return }
             touchInjector.handleTouch(TouchEvent(type: type, x: x, y: y))

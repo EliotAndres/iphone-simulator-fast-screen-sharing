@@ -239,11 +239,16 @@ final class TouchInjector {
               let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let first = array.first,
               let frame = first["frame"] as? [String: Any] else {
+            let snippet = output.count > 400 ? String(output.prefix(400)) + "…" : output
+            print("[Touch] describe-all returned unparseable output:\n\(snippet)")
             return nil
         }
         let width = (frame["width"] as? Double) ?? Double(frame["width"] as? Int ?? 0)
         let height = (frame["height"] as? Double) ?? Double(frame["height"] as? Int ?? 0)
-        guard width > 0, height > 0 else { return nil }
+        guard width > 0, height > 0 else {
+            print("[Touch] describe-all returned frame without dimensions: \(frame)")
+            return nil
+        }
         return CGSize(width: width, height: height)
     }
 
@@ -303,27 +308,39 @@ final class TouchInjector {
     }
 
     /// Returns the python interpreter from the uv-managed venv created by install.sh.
-    private func resolvePython() -> String? {
+    private func resolvePython() -> String? { resolveVenvBinary("python") }
+
+    /// idb lives in the venv created by install.sh. PATH may not include that
+    /// venv when launched from outside a terminal (e.g. start.sh, launchd),
+    /// so we locate it explicitly rather than relying on `env idb`.
+    private func resolveIDB() -> String? { resolveVenvBinary("idb") }
+
+    private func resolveVenvBinary(_ name: String) -> String? {
         let fm = FileManager.default
         let candidates = [
-            "scripts/.venv/bin/python",
+            "scripts/.venv/bin/\(name)",
             URL(fileURLWithPath: CommandLine.arguments[0])
                 .deletingLastPathComponent()
-                .appendingPathComponent("../../../scripts/.venv/bin/python")
+                .appendingPathComponent("../../../scripts/.venv/bin/\(name)")
                 .standardized.path
         ]
         for path in candidates where fm.fileExists(atPath: path) {
             return path
         }
-        print("[Touch] venv not found. Run install.sh first.")
         return nil
     }
 
     private func shell(_ command: String, _ args: String...) -> String {
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [command] + args
+        // Prefer the venv copy of idb so we don't depend on PATH configuration.
+        if command == "idb", let idbPath = resolveIDB() {
+            process.executableURL = URL(fileURLWithPath: idbPath)
+            process.arguments = args
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [command] + args
+        }
         process.standardOutput = pipe
         process.standardError = pipe
         do {

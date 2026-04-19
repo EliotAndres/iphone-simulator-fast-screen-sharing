@@ -29,6 +29,16 @@ final class StreamManager {
     /// encoder so the first frame after connect is immediate, but drop bytes
     /// until a viewer is there.
     private var viewerAttached = false
+    /// Viewer is still connected but its tab is backgrounded. Encoder keeps
+    /// running (simpler than tearing it down) but we don't waste bandwidth.
+    private var viewerPaused = false
+
+    /// Skip re-encoding the exact same pixel buffer — SCStream only delivers on
+    /// content change, so duplicate pointers come from our own idle re-pushes.
+    /// Reset by viewerJoined / requestKeyframe so the next push always goes
+    /// through (and yields a keyframe).
+    private var lastEncodedBufferPtr: UnsafeMutableRawPointer?
+    private var forceNextEncode = true
 
     private var frameCount = 0
 
@@ -42,7 +52,7 @@ final class StreamManager {
             self.sendVideoInit()
         }
         encoder.onFrame = { [weak self] isKey, data, pts in
-            guard let self = self, self.viewerAttached else { return }
+            guard let self = self, self.viewerAttached, !self.viewerPaused else { return }
             self.frameCount += 1
             if self.frameCount % 90 == 0 {
                 print("[Stream] Sent \(self.frameCount) frames, lastKey=\(isKey) bytes=\(data.count)")
@@ -52,6 +62,12 @@ final class StreamManager {
     }
 
     func pushFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+        let ptr = Unmanaged.passUnretained(pixelBuffer).toOpaque()
+        if ptr == lastEncodedBufferPtr && !forceNextEncode {
+            return
+        }
+        lastEncodedBufferPtr = ptr
+        forceNextEncode = false
         encoder.encode(pixelBuffer, pts: timestamp)
     }
 
@@ -60,6 +76,7 @@ final class StreamManager {
     func viewerJoined() {
         print("[Stream] Viewer joined → request keyframe")
         viewerAttached = true
+        forceNextEncode = true
         sendVideoInit()
         encoder.requestKeyframe()
     }
@@ -67,11 +84,29 @@ final class StreamManager {
     func viewerLeft() {
         print("[Stream] Viewer left")
         viewerAttached = false
+        viewerPaused = false
+    }
+
+    /// Browser tab went to background. Keep the WS open but stop sending frames.
+    func pause() {
+        print("[Stream] Viewer paused")
+        viewerPaused = true
+    }
+
+    /// Browser tab returned. The viewer dropped its decoder, so we re-announce
+    /// the codec config and force the next encoded frame to be a keyframe.
+    func resume() {
+        print("[Stream] Viewer resumed → fresh video-init + keyframe")
+        viewerPaused = false
+        forceNextEncode = true
+        sendVideoInit()
+        encoder.requestKeyframe()
     }
 
     /// Browser-initiated (tab became visible, decoder reset, etc.).
     func requestKeyframe() {
         print("[Stream] Keyframe requested by viewer")
+        forceNextEncode = true
         encoder.requestKeyframe()
     }
 

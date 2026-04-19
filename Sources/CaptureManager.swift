@@ -12,8 +12,6 @@ final class CaptureManager: NSObject {
     private var streamConfig: SCStreamConfiguration?
     private let streamQueue = DispatchQueue(label: "com.simulatorstream.capture")
     private var lastPixelBuffer: CVPixelBuffer?
-    private var idleTimer: DispatchSourceTimer?
-    private var hasReceivedRealFrame = false
     /// First N SCStream frames get extra logging (dimensions / format / pts).
     private var debugFrameLogRemaining = 5
     /// One-shot JPEG on disk when `SIMULATOR_STREAM_DEBUG_JPEG=1`.
@@ -48,29 +46,11 @@ final class CaptureManager: NSObject {
         stream = nil
     }
 
-    /// Repeatedly push a frame (screenshot or cached) every 500ms until
-    /// SCStream delivers a real frame. Ensures the newly connected WebRTC
-    /// client receives video even when the simulator screen is static.
-    func startIdleFramePump() {
-        stopIdleFramePump()
-        hasReceivedRealFrame = false
-
-        let timer = DispatchSource.makeTimerSource(queue: streamQueue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(500))
-        timer.setEventHandler { [weak self] in
-            guard let self, !self.hasReceivedRealFrame else {
-                self?.stopIdleFramePump()
-                return
-            }
-            self.pushOneFrame()
-        }
-        timer.resume()
-        idleTimer = timer
-    }
-
-    private func stopIdleFramePump() {
-        idleTimer?.cancel()
-        idleTimer = nil
+    /// Push one frame now — cached if available, else capture a screenshot.
+    /// Called when a viewer connects so they see content immediately even if
+    /// SCStream hasn't delivered anything yet (e.g. a static simulator screen).
+    func pushCurrentFrame() {
+        streamQueue.async { self.pushOneFrame() }
     }
 
     private func pushOneFrame() {
@@ -233,10 +213,6 @@ extension CaptureManager: SCStreamOutput {
             maybeSaveDebugJPEG(pixelBuffer: pixelBuffer)
 
             lastPixelBuffer = pixelBuffer
-            if !hasReceivedRealFrame {
-                hasReceivedRealFrame = true
-                stopIdleFramePump()
-            }
             onFrame?(pixelBuffer, timestamp)
         }
     }
