@@ -332,7 +332,8 @@ final class TouchInjector {
 
     private func shell(_ command: String, _ args: String...) -> String {
         let process = Process()
-        let pipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
         // Prefer the venv copy of idb so we don't depend on PATH configuration.
         if command == "idb", let idbPath = resolveIDB() {
             process.executableURL = URL(fileURLWithPath: idbPath)
@@ -341,13 +342,30 @@ final class TouchInjector {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [command] + args
         }
-        process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        let label = "\(command) \(args.joined(separator: " "))"
         do {
             try process.run()
             process.waitUntilExit()
-        } catch { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        } catch {
+            print("[Shell] launch failed: \(label) error=\(error)")
+            return ""
+        }
+        let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let code = process.terminationStatus
+        let outTrim = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let errTrim = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code != 0 || (outTrim.isEmpty && !errTrim.isEmpty) {
+            print("[Shell] \(label) exit=\(code) stdoutBytes=\(stdout.utf8.count) stderr=\(snippet(errTrim))")
+        } else if !errTrim.isEmpty {
+            print("[Shell] \(label) exit=\(code) stderr=\(snippet(errTrim))")
+        }
+        return outTrim
+    }
+
+    private func snippet(_ s: String, max: Int = 400) -> String {
+        s.count > max ? String(s.prefix(max)) + "…" : s
     }
 }
