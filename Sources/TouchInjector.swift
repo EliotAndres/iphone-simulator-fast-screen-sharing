@@ -315,17 +315,32 @@ final class TouchInjector {
     /// so we locate it explicitly rather than relying on `env idb`.
     private func resolveIDB() -> String? { resolveVenvBinary("idb") }
 
+    /// Always returns an **absolute** path. Relative paths (e.g. `scripts/.venv/bin/idb`)
+    /// break `Process.executableURL` when cwd is not the repo root (Xcode, Finder, etc.).
     private func resolveVenvBinary(_ name: String) -> String? {
         let fm = FileManager.default
-        let candidates = [
-            "scripts/.venv/bin/\(name)",
-            URL(fileURLWithPath: CommandLine.arguments[0])
-                .deletingLastPathComponent()
-                .appendingPathComponent("../../../scripts/.venv/bin/\(name)")
-                .standardized.path
-        ]
-        for path in candidates where fm.fileExists(atPath: path) {
-            return path
+        let suffix = "scripts/.venv/bin/\(name)"
+
+        func ok(_ path: String) -> Bool {
+            fm.fileExists(atPath: path) && fm.isExecutableFile(atPath: path)
+        }
+
+        var roots: [String] = []
+        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath).standardizedFileURL.path
+        roots.append(cwd)
+
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+        var dir = URL(fileURLWithPath: exe).deletingLastPathComponent().path
+        for _ in 0..<12 {
+            if !roots.contains(dir) { roots.append(dir) }
+            let parent = URL(fileURLWithPath: dir).deletingLastPathComponent().path
+            if parent == dir { break }
+            dir = parent
+        }
+
+        for root in roots {
+            let path = URL(fileURLWithPath: root).appendingPathComponent(suffix).standardizedFileURL.path
+            if ok(path) { return path }
         }
         return nil
     }
@@ -338,6 +353,10 @@ final class TouchInjector {
         if command == "idb", let idbPath = resolveIDB() {
             process.executableURL = URL(fileURLWithPath: idbPath)
             process.arguments = args
+        } else if command == "idb" {
+            print("[Touch] idb not found under scripts/.venv/bin — run ./install.sh from the repo root (needs fb-idb). Falling back to PATH.")
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [command] + args
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [command] + args

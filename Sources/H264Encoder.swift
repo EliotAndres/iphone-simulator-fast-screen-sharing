@@ -21,6 +21,8 @@ final class H264Encoder {
     private var outputErrorCount = 0
     /// After repeated encode callback failures (typical in macOS VMs: HW session creates but never emits frames).
     private var softwareEncoderForced = false
+    /// Set from VT output callback; session teardown must run on the `encode` thread to avoid racing `VTCompressionSessionEncodeFrame` (kVTInvalidSessionErr).
+    private var fallbackRebuildNeeded = false
     private let bitrate: Int
     private let fps: Int
 
@@ -48,6 +50,13 @@ final class H264Encoder {
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
         if w != width || h != height {
             softwareEncoderForced = false
+            fallbackRebuildNeeded = false
+        }
+        if fallbackRebuildNeeded {
+            fallbackRebuildNeeded = false
+            print("[Encoder] Rebuilding compression session for software encoder (serialize with capture thread)")
+            invalidate()
+            outputErrorCount = 0
         }
         if session == nil || w != width || h != height {
             configure(width: w, height: h)
@@ -72,6 +81,9 @@ final class H264Encoder {
         )
         if status != noErr {
             print("[Encoder] VTCompressionSessionEncodeFrame failed status=\(status) (\(Self.vtStatusLabel(status))) infoFlags=\(infoFlags)")
+            if status == kVTInvalidSessionErr {
+                invalidate()
+            }
         }
     }
 
@@ -243,8 +255,8 @@ final class H264Encoder {
                (status == kVTCouldNotFindVideoEncoderErr || status == kVTVideoEncoderNotAvailableNowErr),
                n >= 3 {
                 encoder.softwareEncoderForced = true
-                print("[Encoder] Switching to software H.264 encoder after \(n) failed output callbacks (invalidate HW session)")
-                encoder.invalidate()
+                encoder.fallbackRebuildNeeded = true
+                print("[Encoder] Switching to software H.264 encoder after \(n) failed output callbacks (rebuild on next encode)")
             }
             return
         }
