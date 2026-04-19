@@ -18,6 +18,7 @@ final class H264Encoder {
     private var height: Int32 = 0
     private var forceNextKeyframe = false
     private var announcedCodec = false
+    private var outputErrorCount = 0
     private let bitrate: Int
     private let fps: Int
 
@@ -59,7 +60,7 @@ final class H264Encoder {
             infoFlagsOut: &infoFlags
         )
         if status != noErr {
-            print("[Encoder] VTCompressionSessionEncodeFrame failed status=\(status)")
+            print("[Encoder] VTCompressionSessionEncodeFrame failed status=\(status) (\(Self.vtStatusLabel(status))) infoFlags=\(infoFlags)")
         }
     }
 
@@ -78,53 +79,136 @@ final class H264Encoder {
         self.height = height
         self.announcedCodec = false
         self.forceNextKeyframe = true
+        self.outputErrorCount = 0
 
-        var sess: VTCompressionSession?
+        Self.logVideoEncoderList(width: width, height: height)
+
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        // EnableLowLatencyRateControl flips the Apple Silicon hardware encoder into
-        // its videoconferencing mode — drops internal buffering by ~1 frame.
-        let encoderSpec: [CFString: Any] = [
+        // Prefer the HW low-latency rate controller (drops ~1 frame of buffering).
+        // It only exists on the Apple Silicon hardware encoder, so guests under
+        // Virtualization.framework that don't expose the Media Engine fail with
+        // -12915. Fall back to a default session and let VT pick a software encoder.
+        let lowLatencySpec: [CFString: Any] = [
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue as Any
         ]
+        var sess = Self.createSession(width: width, height: height, spec: lowLatencySpec as CFDictionary, refcon: selfPtr, label: "low-latency HW")
+        if sess == nil {
+            sess = Self.createSession(width: width, height: height, spec: nil, refcon: selfPtr, label: "default (SW fallback OK)")
+        }
+        guard let sess = sess else { return }
+
+        func setProp(_ key: CFString, _ value: CFTypeRef, _ label: String) {
+            let s = VTSessionSetProperty(sess, key: key, value: value)
+            if s != noErr {
+                print("[Encoder] VTSessionSetProperty failed \(label) status=\(s) (\(Self.vtStatusLabel(s)))")
+            }
+        }
+
+        setProp(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime")
+        setProp(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel, "ProfileLevel")
+        setProp(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "AllowFrameReordering")
+        setProp(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate) as CFNumber, "AverageBitRate")
+        setProp(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: fps * 2) as CFNumber, "MaxKeyFrameInterval")
+        setProp(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 2.0) as CFNumber, "MaxKeyFrameIntervalDuration")
+        setProp(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps) as CFNumber, "ExpectedFrameRate")
+        setProp(kVTCompressionPropertyKey_MaxFrameDelayCount, NSNumber(value: 0) as CFNumber, "MaxFrameDelayCount")
+        setProp(kVTCompressionPropertyKey_MaxH264SliceBytes, NSNumber(value: 1200) as CFNumber, "MaxH264SliceBytes")
+
+        let prep = VTCompressionSessionPrepareToEncodeFrames(sess)
+        if prep != noErr {
+            print("[Encoder] VTCompressionSessionPrepareToEncodeFrames status=\(prep) (\(Self.vtStatusLabel(prep)))")
+        }
+
+        var hwProp: CFTypeRef?
+        let hwSt = VTSessionCopyProperty(sess, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: kCFAllocatorDefault, valueOut: &hwProp)
+        if hwSt == noErr, let hwProp = hwProp {
+            print("[Encoder] UsingHardwareAcceleratedVideoEncoder (after prepare)=\(hwProp)")
+        } else {
+            print("[Encoder] UsingHardwareAcceleratedVideoEncoder query status=\(hwSt) (\(Self.vtStatusLabel(hwSt))) value=\(String(describing: hwProp))")
+        }
+
+        self.session = sess
+        print("[Encoder] VTCompressionSession ready \(width)x\(height) @ \(fps)fps, bitrate=\(bitrate)")
+    }
+
+    private static func createSession(
+        width: Int32,
+        height: Int32,
+        spec: CFDictionary?,
+        refcon: UnsafeMutableRawPointer,
+        label: String
+    ) -> VTCompressionSession? {
+        var sess: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: width,
             height: height,
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: encoderSpec as CFDictionary,
+            encoderSpecification: spec,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: H264Encoder.outputCallback,
-            refcon: selfPtr,
+            refcon: refcon,
             compressionSessionOut: &sess
         )
-        guard status == noErr, let sess = sess else {
-            print("[Encoder] VTCompressionSessionCreate failed status=\(status)")
-            return
+        if status != noErr || sess == nil {
+            print("[Encoder] VTCompressionSessionCreate(\(label)) failed status=\(status) (\(vtStatusLabel(status))) \(width)x\(height)")
+            return nil
         }
-
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: fps * 2))
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: 2.0))
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: fps))
-        // Never hold frames for reorder / lookahead.
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
-        // Break large frames (esp. keyframes) into MTU-sized slices so the decoder
-        // can start on partial data instead of waiting for a full packet reassembly.
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxH264SliceBytes, value: NSNumber(value: 1200))
-        VTCompressionSessionPrepareToEncodeFrames(sess)
-        self.session = sess
-        print("[Encoder] VTCompressionSession \(width)x\(height) @ \(fps)fps, bitrate=\(bitrate)")
+        print("[Encoder] VTCompressionSessionCreate(\(label)) ok \(width)x\(height)")
+        return sess
     }
 
-    private static let outputCallback: VTCompressionOutputCallback = { refcon, _, status, _, sampleBuffer in
+    private static func logVideoEncoderList(width: Int32, height: Int32) {
+        let opts: [CFString: Any] = [
+            kVTVideoEncoderList_CodecType: NSNumber(value: kCMVideoCodecType_H264)
+        ]
+        var list: CFArray?
+        let s = VTCopyVideoEncoderList(opts as CFDictionary, &list)
+        if s != noErr {
+            print("[Encoder] VTCopyVideoEncoderList failed status=\(s) (\(Self.vtStatusLabel(s)))")
+            return
+        }
+        guard let arr = list as? [NSDictionary] else {
+            print("[Encoder] VTCopyVideoEncoderList: empty or unexpected format")
+            return
+        }
+        print("[Encoder] VTCopyVideoEncoderList: \(arr.count) encoder(s) for H.264 (want \(width)x\(height))")
+        for (i, enc) in arr.prefix(8).enumerated() {
+            let id = enc[kVTVideoEncoderList_EncoderID] ?? "?"
+            let name = enc[kVTVideoEncoderList_EncoderName] ?? "?"
+            let hw = enc[kVTVideoEncoderList_IsHardwareAccelerated] ?? "?"
+            print("[Encoder]   [\(i)] id=\(id) name=\(name) hw=\(hw)")
+        }
+        if arr.count > 8 {
+            print("[Encoder]   ... \(arr.count - 8) more")
+        }
+    }
+
+    private static func vtStatusLabel(_ status: OSStatus) -> String {
+        switch status {
+        case noErr: return "noErr"
+        case kVTCouldNotFindVideoEncoderErr: return "kVTCouldNotFindVideoEncoderErr"
+        case kVTVideoEncoderNotAvailableNowErr: return "kVTVideoEncoderNotAvailableNowErr"
+        case kVTVideoEncoderMalfunctionErr: return "kVTVideoEncoderMalfunctionErr"
+        case kVTInvalidSessionErr: return "kVTInvalidSessionErr"
+        case kVTParameterErr: return "kVTParameterErr"
+        case kVTPropertyNotSupportedErr: return "kVTPropertyNotSupportedErr"
+        default: return "OSStatus(\(status))"
+        }
+    }
+
+    private static let outputCallback: VTCompressionOutputCallback = { refcon, _, status, infoFlags, sampleBuffer in
         guard let refcon = refcon else { return }
         let encoder = Unmanaged<H264Encoder>.fromOpaque(refcon).takeUnretainedValue()
         guard status == noErr, let sampleBuffer = sampleBuffer else {
-            print("[Encoder] Output callback status=\(status)")
+            encoder.outputErrorCount += 1
+            let n = encoder.outputErrorCount
+            let label = H264Encoder.vtStatusLabel(status)
+            let hasBuf = sampleBuffer != nil
+            if n <= 5 || n % 120 == 0 {
+                print("[Encoder] Output callback status=\(status) (\(label)) infoFlags=\(infoFlags) sampleBuffer=\(hasBuf) (count=\(n))")
+            }
             return
         }
         encoder.handleEncoded(sampleBuffer)
